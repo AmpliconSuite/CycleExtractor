@@ -1,10 +1,15 @@
 # CE — Cycle Extractor
-**CE (Cycle Extractor)** is a tool that takes a breakpoint graph (generated from short-read or long-read sequencing) and identifies candidate ecDNA structures by extracting cycles and paths. CE runs on most modern Unix-like operating systems, including: .........
+**CE (Cycle Extractor)** is a computational tool for identifying candidate ecDNA structures from breakpoint graphs.
+It accepts graphs generated from short-read or long-read sequencing and extracts cycles and paths that represent possible circular amplicons.
+
 
 # Requirements: 
 
-python>=..... 
-Gurobi optimizer licence (free for academic use at: https://www.gurobi.com/).
+**python>=3.10**
+**Gurobi optimizer** (free academic license): https://www.gurobi.com/
+Python packages:
+pip install numpy networkx
+(Note:gurobipy is installed automatically when you install Gurobi.)
 
 # Usage
 **Basic Run:**
