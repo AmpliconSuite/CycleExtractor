@@ -6,9 +6,13 @@ It accepts graphs generated from short-read or long-read sequencing and extracts
 # Requirements: 
 
 **python>=3.10**
+
 **Gurobi optimizer** (free academic license): https://www.gurobi.com/
+
 Python packages:
+
 pip install numpy networkx
+
 (Note:gurobipy is installed automatically when you install Gurobi.)
 
 # Usage
