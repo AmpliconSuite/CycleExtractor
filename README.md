@@ -1,4 +1,5 @@
 CE — Cycle Extractor
+**CE (Cycle Extractor)**
 
 CE (Cycle Extractor) is a tool that takes a breakpoint graph (generated from short-read or long-read sequencing) and identifies candidate ecDNA structures by extracting cycles and paths. CE runs on most modern Unix-like operating systems, including: .........
 
