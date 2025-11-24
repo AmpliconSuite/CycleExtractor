@@ -1,5 +1,5 @@
 # CE — Cycle Extractor
-**CE (Cycle Extractor)** is a tool that takes a breakpoint graph (generated from short-read or long-read sequencing) and identifies candidate ecDNA structures by extracting cycles and paths. CE runs on most operating systems, including: Linux, macOS, and Windows. 
+**CE (Cycle Extractor)** is a tool that takes a breakpoint graph (generated from short-read or long-read sequencing) and identifies candidate ecDNA structures by extracting cycles and paths. CE runs on most operating systems, including: Linux and macOS. 
 
 # Requirements: 
 **python>=3.10** 
