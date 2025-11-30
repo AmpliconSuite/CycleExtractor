@@ -7,6 +7,6 @@
 **Gurobi optimizer** (free academic license): https://www.gurobi.com/ Python packages: pip install numpy networkx (gurobipy is installed automatically when you install Gurobi.) 
 
 # Usage
-**Basic Run:** python3 CE.py --graph <path_to_graph_file> 
+**Basic Run:** python3 CE.py --graph <path_to_graph_file> --output <path_to_output(cycles)_file>
 
-**Optional: Enforce connectivity** By default, CE does not enforce connectivity constraints (this keeps the model faster). To enforce connectivity: python3 CE.py --graph <path_to_graph_file> --enforce-connectivity
+**Optional: Enforce connectivity** By default, CE does not enforce connectivity constraints (this keeps the model faster). To enforce connectivity: python3 CE.py --graph <path_to_graph_file> --output <path_to_output(cycles)_file> --enforce-connectivity
