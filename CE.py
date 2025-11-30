@@ -2613,8 +2613,10 @@ delta_F=0
 # -----------------------------------------
 # Parse command-line arguments
 # -----------------------------------------
-parser = argparse.ArgumentParser(description="Run Circular Element ILP Solver.")
-parser.add_argument("--graph", required=True, help="Path to input graph file")
+parser = argparse.ArgumentParser(description="Run Cycle Extractor ILP Solver.")
+parser.add_argument("--graph", required=True, help="Path to input graph file.")
+parser.add_argument("--output", required=True, help="Path to output cycles file.")
+parser.add_argument("--log_file", help="Optional, path to log file.")
 parser.add_argument("--enforce-connectivity",action="store_true",help="Enable connectivity-enforced ILP (default = off)")
 args = parser.parse_args()
 
@@ -2622,16 +2624,12 @@ args = parser.parse_args()
 # Resolve paths
 # -----------------------------------------
 graph_file_path = Path(args.graph).resolve()
-test_dir = graph_file_path.parent   # directory containing the graph
-ilp_test_dir = test_dir
+cycles_file_path = Path(args.output).resolve()
+output_dir = cycles_file_path.parent   # directory containing the graph
 ENFORCE_CONNECTIVITY = args.enforce_connectivity  # <--- HERE
 print(f"Using graph file: {graph_file_path}")
-print(f"Test/output directory: {test_dir}")
+print(f"Test/output directory: {output_dir}")
 
-ilp_test_dir=test_dir
-
-
-#ILP_cycle_file_path = ilp_test_dir/"ILP_cycles_Not_Ordered.txt"
 amplicon_file_name = graph_file_path.name  # e.g., "amplicon1_graph.txt"
 amplicon_name = amplicon_file_name.replace("_graph.txt", "")  # e.g., "amplicon1"           
 #Messages_file_path = test_dir / "Messages.txt"
@@ -2639,14 +2637,13 @@ amplicon_name = amplicon_file_name.replace("_graph.txt", "")  # e.g., "amplicon1
 # Extract amplicon number using regex
 # match = re.search(r"amplicon(\d+)", amplicon_name.lower())
 # amplicon_num = match.group(1) # e.g., "1"
+
 if ENFORCE_CONNECTIVITY:
-    Cycles_file_path = ilp_test_dir / "ILP_Connectivity_cycles.txt"
+    log_file = output_dir / "ILP_Connectivity_log.txt"
 else:
-    Cycles_file_path = ilp_test_dir / "ILP_cycles.txt"
-if ENFORCE_CONNECTIVITY:
-    log_file = test_dir / "ILP_Connectivity_log.txt"
-else:
-    log_file = test_dir / "ILP_log.txt"
+    log_file = output_dir / "ILP_log.txt"
+if args.log_file:
+    log_file = args.log_file
 
 # Redirect stdout to both console and file
 class Logger:
@@ -2677,9 +2674,8 @@ class Logger:
 # Open file in write mode (overwrite) or append mode ('a')
 sys.stdout = Logger(log_file)
 ####################### 
-test_name = test_dir.name
 
-ilp_test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
+#ilp_test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
 if ENFORCE_CONNECTIVITY:
     print("Connectivity is enforced.")
 else:
@@ -3268,6 +3264,6 @@ for item in Disconnected_Solutions:
                 item["New_Order_Of_Path_Number"] = path["New_Order_Of_Path_Number"]
                 break
             
-write_all_cycles_and_paths(segments, Cycles_file_path, All_Cycles_Ordered, All_Paths_Ordered, Path_Constraints)
+write_all_cycles_and_paths(segments, cycles_file_path, All_Cycles_Ordered, All_Paths_Ordered, Path_Constraints)
     
     
