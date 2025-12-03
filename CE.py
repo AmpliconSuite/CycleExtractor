@@ -612,7 +612,8 @@ def build_cycle_model(
                 p_concordant_edges,
                 p_discordant_edges,
                 path_constraints,
-                enforce_connectivity):
+                enforce_connectivity,
+                gamma):
     model = Model("ILP_CoRAL_cycle")
     # Decision variables   
     X_concordant_edge = model.addVars(concordant_edges, vtype=GRB.BINARY, name="X_concordant_edge")
@@ -637,13 +638,13 @@ def build_cycle_model(
     
     ### Objective function
     if len(path_constraints)>0:
-        gamma= 0.01* sum(capacity_sequence_edges[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges if i != 't' and j != 't')/ len(path_constraints)
+        multiplier= gamma* sum(capacity_sequence_edges[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges if i != 't' and j != 't')/ len(path_constraints)
     else:
-        gamma=0
+        multiplier=0
     
    ### Objective: Maximize total flow on sequence edges weighted by length and number of path constraints satisfied
     model.setObjective(
-        sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges if i != 't' and j != 't')+ gamma*sum(P[k] for k in range(len(path_constraints))),
+        sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges if i != 't' and j != 't')+ multiplier*sum(P[k] for k in range(len(path_constraints))),
         GRB.MAXIMIZE
     )
     # Constraint 1: Copy number of an edge ≤ capacity × selection variable (for undirected edges)
@@ -1907,6 +1908,8 @@ def creat_s_t_graph(G,capacity_discordant_edges,K_discordant_edges):
         
         G.add_edge('s', node, type='discordant', capacity=capacity, Read_Count=1000, K=1)
         G.add_edge('t', node, type='discordant', capacity=capacity, Read_Count=1000, K=1)
+        
+        
     
         new_capacity_discordant_edges[tuple(sorted(('s', node)))] = capacity
         new_capacity_discordant_edges[tuple(sorted(('t', node)))] = capacity
@@ -1928,6 +1931,105 @@ def creat_s_t_graph(G,capacity_discordant_edges,K_discordant_edges):
         for u, v, key, attr in G.edges(keys=True, data=True)
         if attr.get("type") == "discordant" and "K" in attr}
     return G,G.nodes,discordant_edges,capacity_discordant_edges,K_discordant_edges
+####### create s t graph like Coral. Connect s and t to the beginning and end of intervals only
+def creat_s_t_graph_Coral(G, capacity_discordant_edges, K_discordant_edges, sequence_edges):
+    """
+    Add source 's' and sink 't' nodes connected to the start/end of intervals
+    derived from connected sequence edges.
+    """
+    G.add_node('s')
+    G.add_node('t')
+    new_capacity_discordant_edges = dict(capacity_discordant_edges)
+
+    # --- Detect intervals ---
+    # Convert edges to list of (chrom, start, end) tuples
+    seq_list = []
+    for u, v in sequence_edges:
+        chrom_u, start_u = u.split(":")
+        chrom_v, end_v = v.split(":")
+        start_u = int(start_u.rstrip("-+"))
+        end_v = int(end_v.rstrip("-+"))
+        seq_list.append((chrom_u, start_u, end_v, u, v))
+
+    # Sort by chromosome, then start position
+    seq_list.sort(key=lambda x: (x[0], x[1]))
+
+    intervals = []
+    if seq_list:
+        chrom, start, end, u_node, v_node = seq_list[0]
+        interval_start_node = u_node
+        interval_end_node = v_node
+        prev_chrom = chrom
+        prev_end = end
+
+        for chrom, start, end, u_node, v_node in seq_list[1:]:
+            if chrom == prev_chrom and start == prev_end + 1:
+                # extend current interval
+                interval_end_node = v_node
+                prev_end = end
+            else:
+                # save previous interval
+                intervals.append((interval_start_node, interval_end_node))
+                # start new interval
+                interval_start_node = u_node
+                interval_end_node = v_node
+                prev_end = end
+                prev_chrom = chrom
+        intervals.append((interval_start_node, interval_end_node))  # last interval
+
+    # --- Add s/t edges for each interval ---
+    for start_node, end_node in intervals:
+        # s -> start
+        dc_cns = [
+            data.get('capacity', 0)
+            for _, _, data in get_incident_edges(G, start_node, edge_type_filter='discordant')
+        ]
+        if dc_cns:
+            capacity = max(dc_cns)
+        else:
+            seq_cns = [
+                data.get('capacity', 0)
+                for _, _, data in get_incident_edges(G, start_node, edge_type_filter='sequence')
+            ]
+            capacity = max(seq_cns) if seq_cns else 0
+        G.add_edge('s', start_node, type='discordant', capacity=capacity, Read_Count=1000, K=1)
+        new_capacity_discordant_edges[tuple(sorted(('s', start_node)))] = capacity
+        G.add_edge('t', start_node, type='discordant', capacity=capacity, Read_Count=1000, K=1)
+        new_capacity_discordant_edges[tuple(sorted(('t', start_node)))] = capacity
+
+        # end -> t
+        dc_cns = [
+            data.get('capacity', 0)
+            for _, _, data in get_incident_edges(G, end_node, edge_type_filter='discordant')
+        ]
+        if dc_cns:
+            capacity = max(dc_cns)
+        else:
+            seq_cns = [
+                data.get('capacity', 0)
+                for _, _, data in get_incident_edges(G, end_node, edge_type_filter='sequence')
+            ]
+            capacity = max(seq_cns) if seq_cns else 0
+        G.add_edge(end_node, 's', type='discordant', capacity=capacity, Read_Count=1000, K=1)
+        new_capacity_discordant_edges[tuple(sorted((end_node, 's')))] = capacity
+        G.add_edge(end_node, 't', type='discordant', capacity=capacity, Read_Count=1000, K=1)
+        new_capacity_discordant_edges[tuple(sorted((end_node, 't')))] = capacity
+
+    # --- Update sets ---
+    discordant_edges = {
+        tuple(sorted((u, v))) 
+        for u, v, attr in G.edges(data=True) 
+        if attr.get('type') == 'discordant'
+    }
+    capacity_discordant_edges = new_capacity_discordant_edges
+    K_discordant_edges = {
+        tuple(sorted((u, v))): attr["K"]
+        for u, v, key, attr in G.edges(keys=True, data=True)
+        if attr.get("type") == "discordant" and "K" in attr
+    }
+
+    return G, G.nodes, discordant_edges, capacity_discordant_edges, K_discordant_edges
+
 ###########
 def build_path_model(
                 G,
@@ -1945,7 +2047,8 @@ def build_path_model(
                 p_concordant_edges,
                 p_discordant_edges,
                 path_constraints,
-                enforce_connectivity):
+                enforce_connectivity,
+                gamma):
     model = Model("ILP_CoRAL_cycle")
     # Decision variables   
     X_concordant_edge = model.addVars(concordant_edges, vtype=GRB.BINARY, name="X_concordant_edge")
@@ -1970,13 +2073,13 @@ def build_path_model(
     
     ### Objective function
     if len(path_constraints)>0:
-        gamma= 0.01* sum(capacity_sequence_edges[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges)/ len(path_constraints)
+        multiplier= gamma* sum(capacity_sequence_edges[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges)/ len(path_constraints)
     else:
-        gamma=0
+        multiplier=0
     
    ### Objective: Maximize total flow on sequence edges weighted by length and number of path constraints satisfied
     model.setObjective(
-        sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges)+ gamma*sum(P[k] for k in range(len(path_constraints))),
+        sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges)+ multiplier*sum(P[k] for k in range(len(path_constraints))),
         GRB.MAXIMIZE
     )
     # Constraint 1: Copy number of an edge ≤ capacity × selection variable (for undirected edges)
@@ -2598,10 +2701,11 @@ def write_all_cycles_and_paths(segments, new_output_file, all_cycles_ordered, al
                 f"Segments={seg_str};"
                 f"Path_constraints_satisfied={path_str}\n"
             )
-###########
-########## The code starts here
+#####################################################################
+################## The code starts here #############################
+#####################################################################
 
-
+__version__ = "1.0.0"
 
 #ENFORCE_CONNECTIVITY = False #True False
 TIME_LIMIT_SECONDS = 2*60*60 #2 * 60 * 60  # 2 hours
@@ -2616,6 +2720,10 @@ delta_F=0
 parser = argparse.ArgumentParser(description="Run Circular Element ILP Solver.")
 parser.add_argument("--graph", required=True, help="Path to input graph file")
 parser.add_argument("--enforce-connectivity",action="store_true",help="Enable connectivity-enforced ILP (default = off)")
+parser.add_argument("--gamma",type=float,default=0.01,help="Gamma value (default = 0.01)")
+parser.add_argument("--version",action="version",version=f"CE version {__version__}",help="Print version and exit")
+parser.add_argument("--sort-by",choices=["CopyNumber", "LWCN"],default="CopyNumber",help="How to sort cycles/paths: CopyNumber (default) or LWCN")
+parser.add_argument("--s-t-strategy",choices=["all_nodes", "intervals"],default="all_nodes",help="s/t connection strategy: 'all_nodes' (default) or 'intervals' (only interval start/end)")
 args = parser.parse_args()
 
 # -----------------------------------------
@@ -2627,6 +2735,14 @@ ilp_test_dir = test_dir
 ENFORCE_CONNECTIVITY = args.enforce_connectivity  # <--- HERE
 print(f"Using graph file: {graph_file_path}")
 print(f"Test/output directory: {test_dir}")
+
+#gamma=0.01
+gamma = args.gamma
+print(f"Gamma value set to: {gamma}")
+print(f"CE version: {__version__}")
+# if args.version:
+#     print(f"CE version {__version__}")
+#     sys.exit(0)
 
 ilp_test_dir=test_dir
 
@@ -2680,6 +2796,15 @@ sys.stdout = Logger(log_file)
 test_name = test_dir.name
 
 ilp_test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
+print(f"CE version: {__version__}")
+print(f"Gamma value set to: {gamma}")
+print(f"Using graph file: {graph_file_path}")
+print(f"Test/output directory: {test_dir}")
+
+#gamma=0.01
+gamma = args.gamma
+
+
 if ENFORCE_CONNECTIVITY:
     print("Connectivity is enforced.")
 else:
@@ -2745,7 +2870,8 @@ while True: #while Iteration==1:
                     p_concordant_edges,
                     p_discordant_edges,
                     path_constraints,
-                    ENFORCE_CONNECTIVITY)
+                    ENFORCE_CONNECTIVITY,
+                    gamma)
     
     ILP_Cycle_model.setParam('TimeLimit', TIME_LIMIT_SECONDS)
     print(f"Start extracting cycle {Cycle_Or_Path_Number}")
@@ -2998,9 +3124,23 @@ if ENFORCE_CONNECTIVITY:
         length_sequence_edges
     )
         
-G,G.nodes,discordant_edges,capacity_discordant_edges,K_discordant_edges = creat_s_t_graph(G,capacity_discordant_edges,K_discordant_edges)
+#G,G.nodes,discordant_edges,capacity_discordant_edges,K_discordant_edges = creat_s_t_graph(G,capacity_discordant_edges,K_discordant_edges)
+#G,G.nodes,discordant_edges,capacity_discordant_edges,K_discordant_edges = creat_s_t_graph_Coral(G,capacity_discordant_edges,K_discordant_edges, sequence_edges)
+
+if args.s_t_strategy == "all_nodes":
+    G, nodes, discordant_edges, capacity_discordant_edges, K_discordant_edges = \
+        creat_s_t_graph(G, capacity_discordant_edges, K_discordant_edges)
+else:
+    sequence_edges_left = {
+        edge for edge, cap in capacity_sequence_edges.items()
+        if cap > 0
+    }
+    G, nodes, discordant_edges, capacity_discordant_edges, K_discordant_edges = \
+        creat_s_t_graph_Coral(G, capacity_discordant_edges, K_discordant_edges, sequence_edges_left)
+
 print("Start path extraction")    
 start=time.time()
+delta_F=0
 while True: # while Iteration==1:
     ILP_Path_model, variables= build_path_model(
                     G,
@@ -3018,7 +3158,8 @@ while True: # while Iteration==1:
                     p_concordant_edges,
                     p_discordant_edges,
                     path_constraints,
-                    ENFORCE_CONNECTIVITY) 
+                    ENFORCE_CONNECTIVITY,
+                    gamma) 
     ILP_Path_model.setParam('TimeLimit', TIME_LIMIT_SECONDS)
     print(f"Start running Iteration {Iteration}")
     start_time = time.time()
@@ -3245,9 +3386,21 @@ while True: # while Iteration==1:
     capacity_concordant_edges, capacity_discordant_edges, capacity_sequence_edges = update_the_graph(concordant_edges, f_concordant_edge_val, X_concordant_edge_val, capacity_concordant_edges,
                          discordant_edges, f_discordant_edge_val, X_discordant_edge_val, capacity_discordant_edges,
                          sequence_edges, f_sequence_edge_val, X_sequence_edge_val, capacity_sequence_edges)
+    Iteration += 1 
+# All_Cycles_Ordered = sorted(All_Cycles, key=lambda x: x["LWCN_excluding_segments"], reverse=True)
+# All_Paths_Ordered = sorted(All_Paths, key=lambda x: x["LWCN_excluding_segments"], reverse=True)
+# All_Cycles_Ordered = sorted(All_Cycles, key=lambda x: x["CopyNumber"], reverse=True)
+# All_Paths_Ordered = sorted(All_Paths, key=lambda x: x["CopyNumber"], reverse=True)
 
-All_Cycles_Ordered = sorted(All_Cycles, key=lambda x: x["LWCN_excluding_segments"], reverse=True)
-All_Paths_Ordered = sorted(All_Paths, key=lambda x: x["LWCN_excluding_segments"], reverse=True)
+#Determine sorting key
+if args.sort_by == "CopyNumber":
+    cycle_sort_key = lambda x: x["CopyNumber"]
+else:  # LWCN
+    cycle_sort_key = lambda x: x["LWCN_excluding_segments"]
+
+# Sort cycles and paths
+All_Cycles_Ordered = sorted(All_Cycles, key=cycle_sort_key, reverse=True)
+All_Paths_Ordered = sorted(All_Paths, key=cycle_sort_key, reverse=True)
 
 for i, cycle in enumerate(All_Cycles_Ordered, start=1):
     cycle["New_Order_Of_Cycle_Number"] = i
