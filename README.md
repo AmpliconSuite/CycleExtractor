@@ -9,7 +9,8 @@
 # Usage
 **Basic Run:** python3 CE.py --graph <path_to_graph_file> --output <path_to_output(cycles)_file>
 
-**Optional Parameters** 
+# Optional Parameters: 
+
 **1. Set Gamma Value** (default = 0.01) 
 python3 CE.py --graph sample_graph.txt --gamma <The value for gamma>
 
