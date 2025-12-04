@@ -11,8 +11,9 @@
 
 # Optional Parameters: 
 
-**1. Set Gamma Value** (default = 0.01) 
-python3 CE.py --graph sample_graph.txt --gamma <The value for gamma>
+**1. Set Gamma Value** (default = 0.01)
+
+python3 CE.py --graph sample_graph.txt --gamma <value>
 
 **2. Check Version**
 python3 CE.py --version
