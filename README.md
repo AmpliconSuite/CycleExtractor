@@ -32,3 +32,4 @@ python3 CE.py --graph mygraph.txt --s-t-strategy intervals
 By default, CE does not enforce connectivity constraints (faster). To enforce connectivity:
 
 python3 CE.py --graph <path_to_graph_file> --output <path_to_output_file> --enforce-connectivity
+**Optional: Enforce connectivity** By default, CE does not enforce connectivity constraints (this keeps the model faster). To enforce connectivity: python3 CE.py --graph <path_to_graph_file> --output <path_to_output(cycles)_file> --enforce-connectivity
