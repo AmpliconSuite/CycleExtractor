@@ -1,0 +1,14 @@
+Interval	1	chr7	54659673	56149664
+List of cycle segments
+Segment	1	chr7	54659673	54763281
+Segment	2	chr7	54763282	55127266
+Segment	3	chr7	55127267	55155020
+Segment	4	chr7	55155021	55609190
+Segment	5	chr7	55609191	55610094
+Segment	6	chr7	55610095	56049369
+Segment	7	chr7	56049370	56149664
+List of longest subpath constraints
+Path constraint	1	e2+:1,c2-:1,e3+:1,c3-:1,e4+:1	Support=6	Unsatisfied
+Path constraint	2	e4+:1,c4-:1,e5+:1,c5-:1,e6+:1	Support=34	Unsatisfied
+List of extracted cycles/paths
+Cycle=1;Copy_count=85.18981770204846;Segments=6+,2+,4+;Path_constraints_satisfied=
