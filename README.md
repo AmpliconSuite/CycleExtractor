@@ -13,7 +13,7 @@
 
 **1. Set Gamma Value** (default = 0.01)
 
-python3 CE.py --graph sample_graph.txt --gamma <value>
+python3 CE.py --graph sample_graph.txt --output <path_to_output(cycles)_file> --gamma <value>
 
 **2. Check Version**
 python3 CE.py --version
@@ -21,12 +21,12 @@ python3 CE.py --version
 **3. Sort Cycles/Paths** (default = CopyNumber)
 By default, CE sorts and prints cycles by their copy number. Here we give the option to the user to sort by the Length Weighted Copy Number of the cycle:
 
-python3 CE.py --graph file.txt --sort-by LWCN
+python3 CE.py --graph file.txt --output <path_to_output(cycles)_file> --sort-by LWCN
 
 **4. s/t Node Connection Strategy** (default = all_nodes)
 Choose whether to add source/sink nodes to all nodes or only to interval start/end nodes:
 
-python3 CE.py --graph mygraph.txt --s-t-strategy intervals
+python3 CE.py --graph mygraph.txt --output <path_to_output(cycles)_file> --s-t-strategy intervals
 
 **5. Enforce Connectivity** 
 By default, CE does not enforce connectivity constraints (faster). To enforce connectivity:
