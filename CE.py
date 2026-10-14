@@ -825,6 +825,13 @@ def compute_LWCN_graph_excluding_some_edges(capacity_sequence_edges,length_seque
         for edge in valid_edges
     )
     return weight
+########## Divide, but return NaN (not a number) instead of crashing when the denominator is 0.
+########## weight_graph_excluding_some_segments is 0 when no segment has CN>5 (e.g. a single low-level
+########## amplified segment), and then the "excluding some segments" ratios are undefined.
+def ratio_or_nan(numerator, denominator):
+    if denominator == 0:
+        return float("nan")
+    return numerator / denominator
 ######### Build the model
 def build_cycle_model(
                 G,
@@ -3497,7 +3504,7 @@ while True: #while Iteration==1:
     weight_ILP_cycle_excluding_some_segments=compute_LWCN_solution_excludeing_some_segments(capacity_sequence_edges_original,sequence_edges,f_sequence_edge_val,length_sequence_edges, Final_closed_walk)                
 
     length_ILP_cycle_excluding_some_segments = weight_ILP_cycle_excluding_some_segments / F_val
-    weight_ratio_ILP_cycle_excluding_some_segments.append(weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments)
+    weight_ratio_ILP_cycle_excluding_some_segments.append(ratio_or_nan(weight_ILP_cycle_excluding_some_segments, weight_graph_excluding_some_segments))
     total_solution_weight += weight_ILP_cycle_excluding_some_segments
     # write_LWCN_cycle_in_file(LWCN_output_path
     #                          ,weight_ILP_cycle,weight_graph,weight_ratio_ILP_cycle,length_ILP_cycle
@@ -3511,7 +3518,7 @@ while True: #while Iteration==1:
                 "LWCN": weight_ILP_cycle,  # length-weighted copy number
                 "LWCN_excluding_segments": weight_ILP_cycle_excluding_some_segments,
                 "LWCNR": weight_ILP_cycle/weight_graph,  # length-weighted copy number
-                "LWCNR_excluding_segments": weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments,
+                "LWCNR_excluding_segments": ratio_or_nan(weight_ILP_cycle_excluding_some_segments, weight_graph_excluding_some_segments),
                 "Matched_Index_Set": matched_index_set, # This is for the path constraints satisifed
                 }
     if not Final_closed_walk_completion_test :
@@ -3589,7 +3596,7 @@ while True: #while Iteration==1:
         weight_ILP_cycle_excluding_some_segments=compute_LWCN_solution_excludeing_some_segments(capacity_sequence_edges_original,sequence_edges,f_sequence_edge_val,length_sequence_edges, Final_closed_walk)                
 
         length_ILP_cycle_excluding_some_segments = weight_ILP_cycle_excluding_some_segments / F_val
-        weight_ratio_ILP_cycle_excluding_some_segments.append(weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments)
+        weight_ratio_ILP_cycle_excluding_some_segments.append(ratio_or_nan(weight_ILP_cycle_excluding_some_segments, weight_graph_excluding_some_segments))
         total_solution_weight += weight_ILP_cycle_excluding_some_segments
         # write_LWCN_cycle_in_file(LWCN_output_path
         #                          ,weight_ILP_cycle,weight_graph,weight_ratio_ILP_cycle,length_ILP_cycle
@@ -3603,7 +3610,7 @@ while True: #while Iteration==1:
                     "LWCN": weight_ILP_cycle,  # length-weighted copy number
                     "LWCN_excluding_segments": weight_ILP_cycle_excluding_some_segments,
                     "LWCNR": weight_ILP_cycle/weight_graph,  # length-weighted copy number
-                    "LWCNR_excluding_segments": weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments,
+                    "LWCNR_excluding_segments": ratio_or_nan(weight_ILP_cycle_excluding_some_segments, weight_graph_excluding_some_segments),
                     "Matched_Index_Set": matched_index_set, # This is for the path constraints satisifed
                     }
         if not Final_closed_walk_completion_test :
@@ -3789,7 +3796,7 @@ while True: # while Iteration==1:
     weight_ratio_ILP_path.append(weight_ILP_path/weight_graph)
     weight_ILP_path_excluding_some_segments=compute_LWCN_solution_excludeing_some_segments(capacity_sequence_edges_original,sequence_edges,f_sequence_edge_val,length_sequence_edges, s_t_Walk[0])
     length_ILP_path_excluding_some_segments = weight_ILP_path_excluding_some_segments /F_val
-    weight_ratio_ILP_path_excluding_some_segments.append(weight_ILP_path_excluding_some_segments/weight_graph_excluding_some_segments)
+    weight_ratio_ILP_path_excluding_some_segments.append(ratio_or_nan(weight_ILP_path_excluding_some_segments, weight_graph_excluding_some_segments))
     total_solution_weight += weight_ILP_path_excluding_some_segments
     # write_LWCN_path_in_file(LWCN_output_path
     #                          ,weight_ILP_path,weight_graph,weight_ratio_ILP_path,length_ILP_path
@@ -3803,7 +3810,7 @@ while True: # while Iteration==1:
                 "LWCN": weight_ILP_path,  # length-weighted copy number
                 "LWCN_excluding_segments": weight_ILP_path_excluding_some_segments,
                 "LWCNR": weight_ILP_path/weight_graph,  # length-weighted copy number
-                "LWCNR_excluding_segments": weight_ILP_path_excluding_some_segments/weight_graph_excluding_some_segments,
+                "LWCNR_excluding_segments": ratio_or_nan(weight_ILP_path_excluding_some_segments, weight_graph_excluding_some_segments),
                 "Matched_Index_Set": matched_index_set, # This is for the path constraints satisifed
                 }
     All_Paths.append(Path_Info) 
@@ -3879,7 +3886,7 @@ while True: # while Iteration==1:
         weight_ILP_cycle_excluding_some_segments=compute_LWCN_solution_excludeing_some_segments(capacity_sequence_edges_original,sequence_edges,f_sequence_edge_val,length_sequence_edges, Final_closed_walk)                
 
         length_ILP_cycle_excluding_some_segments = weight_ILP_cycle_excluding_some_segments/F_val
-        weight_ratio_ILP_cycle_excluding_some_segments.append(weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments)
+        weight_ratio_ILP_cycle_excluding_some_segments.append(ratio_or_nan(weight_ILP_cycle_excluding_some_segments, weight_graph_excluding_some_segments))
 
         total_solution_weight += weight_ILP_cycle_excluding_some_segments
         # write_LWCN_cycle_in_file(LWCN_output_path
@@ -3894,7 +3901,7 @@ while True: # while Iteration==1:
                     "LWCN": weight_ILP_cycle,  # length-weighted copy number
                     "LWCN_excluding_segments": weight_ILP_cycle_excluding_some_segments,
                     "LWCNR": weight_ILP_cycle/weight_graph,  # length-weighted copy number
-                    "LWCNR_excluding_segments": weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments,
+                    "LWCNR_excluding_segments": ratio_or_nan(weight_ILP_cycle_excluding_some_segments, weight_graph_excluding_some_segments),
                     "Matched_Index_Set": matched_index_set, # This is for the path constraints satisifed
                     }
         if not Final_closed_walk_completion_test :
