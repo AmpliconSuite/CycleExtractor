@@ -1,13 +1,12 @@
 try:
-    from gurobipy import Model, GRB
+    from gurobipy import Model as GurobiModel, GRB as GurobiGRB
 except ImportError:
-    Model = None
-    GRB = None
-
+    GurobiModel = GurobiGRB = None
 try:
     import highspy
 except ImportError:
     highspy = None
+Model, GRB = GurobiModel, GurobiGRB
 import re
 import networkx as nx
 import random
@@ -24,11 +23,12 @@ import os
 import argparse
 import subprocess
 from pathlib import Path
-
-
+##############################
 class HighsGRB:
     """Small constant set used by the solver-neutral model formulations."""
 
+    OPTIMAL = "optimal"
+    TIME_LIMIT = "time_limit"
     BINARY = "binary"
     INTEGER = "integer"
     CONTINUOUS = "continuous"
@@ -155,16 +155,11 @@ class HighsModel:
             )
         self.name = name
         self._highs = highspy.Highs()
-        self._highs.cbLogging.subscribe(self._forward_highs_log)
         self._variables = []
         self._model_status = None
         self.status = None
-
-    @staticmethod
-    def _forward_highs_log(event):
-        """Forward native HiGHS progress messages through CE's stdout logger."""
-        sys.stdout.write(event.message)
-        sys.stdout.flush()
+        self.Status = None
+        self.SolCount = 0
 
     def addVar(self, name, vtype=HighsGRB.CONTINUOUS, lb=0.0, ub=None):
         index = len(self._variables)
@@ -222,36 +217,103 @@ class HighsModel:
         option_name = {
             "timelimit": "time_limit",
             "time_limit": "time_limit",
+            "seed": "random_seed",
+            "threads": "threads",
         }.get(name.lower(), name)
-        self._highs.setOptionValue(option_name, value)
+        status = self._highs.setOptionValue(option_name, value)
+        if status == highspy.HighsStatus.kError:
+            raise ValueError(f"HiGHS rejected option {option_name}={value}")
 
     def optimize(self):
+        # Route native solver messages through CE's existing timestamped logger.
+        self._highs.cbLogging.subscribe(lambda event: print(event.message, end=""))
+        # HiGHS 1.10 requires console logging enabled for logging callbacks.
+        self._highs.setOptionValue("output_flag", True)
+        self._highs.setOptionValue("log_to_console", True)
         self._highs.run()
         self._model_status = self._highs.getModelStatus()
-        self.status = self._model_status
+        statuses = {
+            highspy.HighsModelStatus.kOptimal: HighsGRB.OPTIMAL,
+            highspy.HighsModelStatus.kTimeLimit: HighsGRB.TIME_LIMIT,
+        }
+        self.Status = statuses.get(self._model_status, str(self._model_status))
+        self.status = self.Status
         solution = self._highs.getSolution()
-        if solution.value_valid:
+        feasible = self._highs.getInfo().primal_solution_status == highspy.SolutionStatus.kSolutionStatusFeasible
+        self.SolCount = int(solution.value_valid and feasible)
+        if self.SolCount:
             for variable, value in zip(self._variables, solution.col_value):
                 variable.X = float(value)
+            self.ObjVal = self._highs.getObjectiveValue()
 
     def is_optimal(self):
         return self._model_status == highspy.HighsModelStatus.kOptimal
 
 
-def optimization_model_is_optimal(model):
-    """Return True when either solver backend reports an optimal solution."""
-    if isinstance(model, HighsModel):
-        return model.is_optimal()
-    return GRB is not None and model.status == GRB.OPTIMAL
 
-##############################
+def stable_iter(values):
+    """Sort unordered collections without changing ordered walks or lists."""
+    return sorted(values) if isinstance(values, (set, frozenset, dict)) else values
+
+
+def minimum_rotation(tokens):
+    """Lexicographically minimal circular rotation, in linear time."""
+    if not tokens:
+        return []
+    doubled = tokens + tokens
+    n = len(tokens)
+    i, j, k = 0, 1, 0
+    while i < n and j < n and k < n:
+        a, b = doubled[i + k], doubled[j + k]
+        if a == b:
+            k += 1
+            continue
+        if a > b:
+            i += k + 1
+            if i <= j:
+                i = j + 1
+        else:
+            j += k + 1
+            if j <= i:
+                j = i + 1
+        k = 0
+    start = min(i, j)
+    return doubled[start:start + n]
+
+
+def canonical_segments(segments, circular):
+    """Choose a consistent rotation/direction; preserve linear endpoints."""
+    tokens = list(segments)
+    has_endpoints = not circular and len(tokens) >= 2 and tokens[0][:-1] == "0" and tokens[-1][:-1] == "0"
+    if has_endpoints:
+        tokens = tokens[1:-1]
+    reverse = [token[:-1] + ("-" if token[-1] == "+" else "+") for token in stable_iter(reversed(tokens))]
+    if circular:
+        result = min(minimum_rotation(tokens), minimum_rotation(reverse))
+    else:
+        result = min(tokens, reverse)
+    return ["0+"] + result + ["0-"] if has_endpoints else result
+
+
+def optimization_model_is_optimal(model):
+    """Whether the selected solver proved the model optimal."""
+    return model.Status == GRB.OPTIMAL
+
+
+def optimization_model_has_usable_solution(model):
+    """Accept optimal solutions or a feasible incumbent at the time limit."""
+    return model.SolCount > 0 and (
+        optimization_model_is_optimal(model) or model.Status == GRB.TIME_LIMIT
+    )
+
+
 def parse_graph_file(graph_file_path):
     segments = {}
     Path_Constraints = []
     seg_id = 1
 
     with open(graph_file_path) as f:
-        for line in f:
+        for line in stable_iter(f):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -306,7 +368,7 @@ class DiscordantEdge:
 class EdgeMultiplicityModel:
     def __init__(self, edge_dict: dict[int, dict]):
         self.discordant_edges = [
-            DiscordantEdge(info["ReadCount"]) for info in edge_dict.values()
+            DiscordantEdge(info["ReadCount"]) for info in stable_iter(edge_dict.values())
         ]
 
     @staticmethod
@@ -328,7 +390,7 @@ class EdgeMultiplicityModel:
         score = -10.0
         best_ri = base_ri
         sum_deviation = 1.0
-        for base_ri_ in range(base_ri, 0, -1):
+        for base_ri_ in stable_iter(range(base_ri, 0, -1)):
             base_avg_rc = cast(float, np.average(rc_list_p[:base_ri_]))
             base_size = len(rc_list_p[:base_ri_])
             sizes = {}
@@ -339,7 +401,7 @@ class EdgeMultiplicityModel:
             while rc_list_p[base_ri_] / base_avg_rc >= multiplicity + 0.5:
                 multiplicity += 1
             sum_gap = np.log2(rc_list_p[base_ri_]) - np.log2(rc_list_p[base_ri_ - 1])
-            for i in range(base_ri_, len(rc_list_p)):
+            for i in stable_iter(range(base_ri_, len(rc_list_p))):
                 if rc_list_p[i] / base_avg_rc >= multiplicity + 0.5:
                     sum_gap += np.log2(rc_list_p[i]) - np.log2(rc_list_p[i - 1])
                     sizes[multiplicity] = [li, i - 1]
@@ -350,7 +412,7 @@ class EdgeMultiplicityModel:
             if multiplicity > max_multiplicity:
                 continue
             size_flag = True
-            for m in range(2, multiplicity + 1):
+            for m in stable_iter(range(2, multiplicity + 1)):
                 if m in sizes and sizes[m][1] - sizes[m][0] >= base_size:
                     size_flag = False
                     break
@@ -364,7 +426,7 @@ class EdgeMultiplicityModel:
                             rc_list_p[sizes[m][0] : sizes[m][1] + 1] / base_avg_rc  # type: ignore[operator]
                         )
                     )
-                    for m in range(2, multiplicity + 1)
+                    for m in stable_iter(range(2, multiplicity + 1))
                     if m in sizes
                 ],
                 0,
@@ -385,21 +447,21 @@ class EdgeMultiplicityModel:
         if k == 0:
             yield [[start, end]]
         else:
-            for i in range(1, end - start - k + 2):
-                for res in EdgeMultiplicityModel.enumerate_partitions(k - 1, start + i, end):
+            for i in stable_iter(range(1, end - start - k + 2)):
+                for res in stable_iter(EdgeMultiplicityModel.enumerate_partitions(k - 1, start + i, end)):
                     yield [[start, start + i - 1], *res]
 
     def infer_discordant_edge_multiplicities(
         self, max_multiplicity: int = 5
     ) -> List[int]:
         """Estimate the upper bound of multiplicities for each discordant edge."""
-        rc_list = [de.lr_count for de in self.discordant_edges]  # Read counts
+        rc_list = [de.lr_count for de in stable_iter(self.discordant_edges)]  # Read counts
         if len(rc_list) == 0:
             return []
         rc_indices = np.argsort(rc_list)
         rc_list = sorted(rc_list)
         if np.log2(rc_list[-1]) - np.log2(rc_list[0]) < 1.0:
-            return [1 for i in rc_indices]
+            return [1 for i in stable_iter(rc_indices)]
         num_clusters = 1
         valid_clustering = False
         best_score_all = -10.0
@@ -408,13 +470,13 @@ class EdgeMultiplicityModel:
     
         while not valid_clustering:
             valid_clustering = False
-            for partitions in EdgeMultiplicityModel.enumerate_partitions(
+            for partitions in stable_iter(EdgeMultiplicityModel.enumerate_partitions(
                 num_clusters - 1, 0, len(rc_list) - 1
-            ):
+            )):
                 valid_partition = True
                 score_all = 0.0
                 distinct = []
-                for pi in range(len(partitions)):
+                for pi in stable_iter(range(len(partitions))):
                     partition = partitions[pi]
                     scored_partition = EdgeMultiplicityModel.check_valid_discordant_rc_partition(
                         rc_list,
@@ -440,10 +502,10 @@ class EdgeMultiplicityModel:
             if not valid_clustering:
                 num_clusters += 1
         multiplicities_sorted = []
-        for pi in range(len(best_partitions)):
+        for pi in stable_iter(range(len(best_partitions))):
             partition = best_partitions[pi]
             base_ = distinct_all[pi]
-            for i in range(base_[0], base_[1] + 1):
+            for i in stable_iter(range(base_[0], base_[1] + 1)):
                 multiplicities_sorted.append(1)
             base_ri = base_[1] + 1
             if base_ri > partition[1]:
@@ -452,13 +514,13 @@ class EdgeMultiplicityModel:
             multiplicity = 2
             while rc_list[base_ri] / base_avg_rc >= multiplicity + 0.5:
                 multiplicity += 1
-            for i in range(base_ri, partition[1] + 1):
+            for i in stable_iter(range(base_ri, partition[1] + 1)):
                 while rc_list[i] / base_avg_rc >= multiplicity + 0.5:
                     multiplicity += 1
                 multiplicities_sorted.append(multiplicity)
         return [
             multiplicities_sorted[list(rc_indices).index(i)]
-            for i in range(len(rc_list))
+            for i in stable_iter(range(len(rc_list)))
         ]
 #################
 def get_incident_edges(G, node, edge_type_filter=None):
@@ -474,17 +536,17 @@ def get_incident_edges(G, node, edge_type_filter=None):
         List of tuples: (neighbor_node, edge_key, edge_data_dict)
     """
     incident_edges = []
-    for neighbor in G.neighbors(node):
+    for neighbor in stable_iter(G.neighbors(node)):
         edges_between = G.get_edge_data(node, neighbor)
         if edges_between is None:
             continue
-        for edge_key, edge_data in edges_between.items():
+        for edge_key, edge_data in stable_iter(edges_between.items()):
             if edge_type_filter is None or edge_data.get('type') == edge_type_filter:
                 incident_edges.append((neighbor, edge_key, edge_data))
     return incident_edges 
 #### Create the graph file with integer node for foldbacks
 #### There iare no "s" and "t" here
-def Create_graph(graph_file_path):
+def Create_graph(graph_file_path, max_multiplicity=5):
     G = nx.MultiGraph()
     i = 1  # Reset foldback ID counter
 
@@ -497,6 +559,9 @@ def Create_graph(graph_file_path):
     seq_edges_dict = dict()
     conc_edges_dict = dict()
     disc_edges_dict = dict()
+    # Input discordant-line indices remain stable when foldbacks expand.
+    disc_line_to_keys = {}
+    disc_line = 0
     
     seq_counter = 0
     conc_counter = 0
@@ -504,7 +569,7 @@ def Create_graph(graph_file_path):
     with open(graph_file_path, "r") as file:
         section = None
         
-        for line in file:
+        for line in stable_iter(file):
             line = line.strip()
             
             # Identify sections
@@ -591,6 +656,7 @@ def Create_graph(graph_file_path):
                     copy_count = float(copy_count)  # Convert to float
                 except ValueError:
                     copy_count = 0.0  # If conversion fails, set to 0.0
+                disc_line_to_keys[disc_line] = []
                 if start != end: # I want to avoid loops for now
                    G.add_nodes_from([start,end])
                    G.add_edge(start, end, type='discordant', capacity=copy_count, Read_Count=read_count)
@@ -601,6 +667,7 @@ def Create_graph(graph_file_path):
                         "PredictedCN": copy_count,
                         "ReadCount": read_count
                    }
+                   disc_line_to_keys[disc_line].append(disc_counter)
                    disc_counter += 1
                 else:
                    G.add_nodes_from([start, str(i), str(i + 1)])
@@ -611,6 +678,7 @@ def Create_graph(graph_file_path):
                         "PredictedCN": copy_count,
                         "ReadCount": read_count
                     }
+                   disc_line_to_keys[disc_line].append(disc_counter)
                    disc_counter += 1
                    
                    G.add_edge(str(i),str(i+1), type='sequence', capacity=copy_count, length=1)
@@ -621,9 +689,11 @@ def Create_graph(graph_file_path):
                         "PredictedCN": copy_count,
                         "ReadCount": read_count
                     }
+                   disc_line_to_keys[disc_line].append(disc_counter)
                    disc_counter += 1
                    
                    i=i+2
+                disc_line += 1
                    
             if section == "path_constraint" and line.startswith("path_constraint"):
                     
@@ -642,7 +712,7 @@ def Create_graph(graph_file_path):
                     disc_set = []
             
         
-                    for token in edge_tokens:
+                    for token in stable_iter(edge_tokens):
                         if ":" not in token:
                             continue
                         edge_token, _ = token.split(":")
@@ -653,8 +723,9 @@ def Create_graph(graph_file_path):
                             seq_set.append(seq_edges_dict[edge_num-1])
                         elif edge_type == "c" and edge_num-1 in conc_edges_dict:
                             conc_set.append(conc_edges_dict[edge_num-1])
-                        elif edge_type == "d" and edge_num-1 in disc_edges_dict:
-                            disc_set.append(disc_edges_dict[edge_num-1])
+                        elif edge_type == "d" and edge_num-1 in disc_line_to_keys:
+                            for key in stable_iter(disc_line_to_keys[edge_num-1]):
+                                disc_set.append(disc_edges_dict[key])
                             
                     seq_edges_pc.append(seq_set)
                     conc_edges_pc.append(conc_set)
@@ -669,42 +740,44 @@ def Create_graph(graph_file_path):
                 
         disc_edges_readcount= {
             k: {"ReadCount": float(v["ReadCount"])}
-            for k, v in disc_edges_dict.items()
+            for k, v in stable_iter(disc_edges_dict.items())
         }
         
         # Pass it to the model class
         Multiplicity_bound_model = EdgeMultiplicityModel(disc_edges_readcount)
 
         # Call the function to get multiplicities
-        K = Multiplicity_bound_model.infer_discordant_edge_multiplicities(max_multiplicity=5)
+        K = Multiplicity_bound_model.infer_discordant_edge_multiplicities(
+            max_multiplicity=max_multiplicity
+        )
         
-        for edge_key, k in zip(disc_edges_dict.keys(), K):
+        for edge_key, k in stable_iter(zip(disc_edges_dict.keys(), K)):
             disc_edges_dict[edge_key]["K"] = k
             
             
-        for edge_info in disc_edges_dict.values():
+        for edge_info in stable_iter(disc_edges_dict.values()):
             u = edge_info["StartPosition"]
             v = edge_info["EndPosition"]
             k_val = edge_info["K"]
         
-            for key in G[u][v]:
+            for key in stable_iter(G[u][v]):
                 attr = G[u][v][key]
                 if attr.get("type") == "discordant":
                     G[u][v][key]["K"] = k_val
                     
         nodes=G.nodes
         
-        concordant_edges = {tuple(sorted((u, v))) for u, v, attr in G.edges(data=True) if attr.get('type') == 'concordant'}
-        capacity_concordant_edges = {tuple(sorted((u,v))): attr['capacity'] for u, v, attr in G.edges(data=True) if attr.get('type') == 'concordant'}
+        concordant_edges = {tuple(sorted((u, v))) for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'concordant'}
+        capacity_concordant_edges = {tuple(sorted((u,v))): attr['capacity'] for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'concordant'}
         
-        discordant_edges = {tuple(sorted((u, v))) for u, v, attr in G.edges(data=True) if attr.get('type') == 'discordant'}
-        capacity_discordant_edges = {tuple(sorted((u,v))): attr['capacity'] for u, v, attr in G.edges(data=True) if attr.get('type') == 'discordant'}
-        read_count_discordant_edges = {tuple(sorted((u,v))): attr['Read_Count'] for u, v, attr in G.edges(data=True) if attr.get('type') == 'discordant'}
-        K_discordant_edges = {tuple(sorted((u, v))): attr["K"]for u, v, key, attr in G.edges(keys=True, data=True)if attr.get("type") == "discordant" and "K" in attr}
+        discordant_edges = {tuple(sorted((u, v))) for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'discordant'}
+        capacity_discordant_edges = {tuple(sorted((u,v))): attr['capacity'] for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'discordant'}
+        read_count_discordant_edges = {tuple(sorted((u,v))): attr['Read_Count'] for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'discordant'}
+        K_discordant_edges = {tuple(sorted((u, v))): attr["K"]for u, v, key, attr in stable_iter(G.edges(keys=True, data=True))if attr.get("type") == "discordant" and "K" in attr}
         
-        sequence_edges = {tuple(sorted((u,v))) for u, v, attr in G.edges(data=True) if attr.get('type') == 'sequence'}
-        capacity_sequence_edges = {tuple(sorted((u, v))): attr['capacity'] for u, v, attr in G.edges(data=True) if attr.get('type') == 'sequence'}
-        length_sequence_edges = {tuple(sorted((u, v))): attr['length'] for u, v, attr in G.edges(data=True) if attr.get('type') == 'sequence'}
+        sequence_edges = {tuple(sorted((u,v))) for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'sequence'}
+        capacity_sequence_edges = {tuple(sorted((u, v))): attr['capacity'] for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'sequence'}
+        length_sequence_edges = {tuple(sorted((u, v))): attr['length'] for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'sequence'}
         
         
         #### define p_ij^k which indictae if edge ij is in P_k or not
@@ -717,10 +790,10 @@ def Create_graph(graph_file_path):
         p_discordant_edges = {}
         p_sequence_edges = {}
         
-        for k, path_constraint in enumerate(path_constraints):
+        for k, path_constraint in stable_iter(enumerate(path_constraints)):
             edge_tokens = path_constraint["paths"]
         
-            for token in edge_tokens:
+            for token in stable_iter(edge_tokens):
                 if ":" not in token:
                     continue
                 edge_token, _ = token.split(":")
@@ -742,10 +815,11 @@ def Create_graph(graph_file_path):
                     i, j = sorted((edge_data["StartPosition"], edge_data["EndPosition"]))
                     p_concordant_edges[(i, j, k)] = 1
         
-                elif edge_type == "d" and (edge_num - 1) in disc_edges_dict:
-                    edge_data = disc_edges_dict[edge_num - 1]
-                    i, j = sorted((edge_data["StartPosition"], edge_data["EndPosition"]))
-                    p_discordant_edges[(i, j, k)] = 1
+                elif edge_type == "d" and (edge_num - 1) in disc_line_to_keys:
+                    for key in stable_iter(disc_line_to_keys[edge_num - 1]):
+                        edge_data = disc_edges_dict[key]
+                        i, j = sorted((edge_data["StartPosition"], edge_data["EndPosition"]))
+                        p_discordant_edges[(i, j, k)] = 1
         
     return (
             G,
@@ -773,13 +847,13 @@ def creat_s_t_graph_for_connected_cycles(G,capacity_discordant_edges,capacity_se
     new_capacity_discordant_edges = dict(capacity_discordant_edges)
     new_capacity_sequence_edges = dict(capacity_sequence_edges)
     
-    for node in G.nodes():
+    for node in stable_iter(G.nodes()):
         if node in {'s', 't'} or (isinstance(node, str) and node.isdigit()):
             continue
         
         # Compute capacity from incident edges
-        dc_cns = [data.get('capacity', 0) for _, _, data in get_incident_edges(G, node, edge_type_filter='discordant')]
-        seq_cns = [data.get('capacity', 0) for _, _, data in get_incident_edges(G, node, edge_type_filter='sequence')]
+        dc_cns = [data.get('capacity', 0) for _, _, data in stable_iter(get_incident_edges(G, node, edge_type_filter='discordant'))]
+        seq_cns = [data.get('capacity', 0) for _, _, data in stable_iter(get_incident_edges(G, node, edge_type_filter='sequence'))]
         capacity = max(dc_cns + seq_cns) if (dc_cns + seq_cns) else 1
         
         # Add edges (undirected)
@@ -790,11 +864,11 @@ def creat_s_t_graph_for_connected_cycles(G,capacity_discordant_edges,capacity_se
         new_capacity_discordant_edges[tuple(sorted(('s', node)))] = capacity
         new_capacity_sequence_edges[tuple(sorted(('t', node)))] = capacity
     
-    discordant_edges = {tuple(sorted((u, v))) for u, v, attr in G.edges(data=True) if attr.get('type') == 'discordant'}
-    sequence_edges = {tuple(sorted((u, v))) for u, v, attr in G.edges(data=True) if attr.get('type') == 'sequence'}
+    discordant_edges = {tuple(sorted((u, v))) for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'discordant'}
+    sequence_edges = {tuple(sorted((u, v))) for u, v, attr in stable_iter(G.edges(data=True)) if attr.get('type') == 'sequence'}
     
-    K_discordant_edges = {tuple(sorted((u, v))): attr["K"] for u, v, key, attr in G.edges(keys=True, data=True) if attr.get("type") == "discordant" and "K" in attr}
-    length_sequence_edges = {tuple(sorted((u, v))): attr.get("length", 1) for u, v, key, attr in G.edges(keys=True, data=True) if attr.get("type") == "sequence"}
+    K_discordant_edges = {tuple(sorted((u, v))): attr["K"] for u, v, key, attr in stable_iter(G.edges(keys=True, data=True)) if attr.get("type") == "discordant" and "K" in attr}
+    length_sequence_edges = {tuple(sorted((u, v))): attr.get("length", 1) for u, v, key, attr in stable_iter(G.edges(keys=True, data=True)) if attr.get("type") == "sequence"}
     
     return G, G.nodes, discordant_edges, new_capacity_discordant_edges, sequence_edges, new_capacity_sequence_edges, K_discordant_edges, length_sequence_edges
 
@@ -802,29 +876,15 @@ def creat_s_t_graph_for_connected_cycles(G,capacity_discordant_edges,capacity_se
 def compute_Length_weighted_copy_number_graph(capacity_sequence_edges,length_sequence_edges):
     valid_edges = [
         tuple(sorted((i, j)))
-        for (i, j) in sequence_edges
+        for (i, j) in stable_iter(sequence_edges)
         if i != "t" and j != "t" and i != "s" and j != "s" and not i.isdigit() and not j.isdigit()
     ]
     weight = sum(
         capacity_sequence_edges[edge] * length_sequence_edges[edge]
-        for edge in valid_edges
+        for edge in stable_iter(valid_edges)
     )
     return weight
 ########## Calculate Length weighted copy number of the graph. Here we do not consider segments with CN<5. (CN of the graph)
-def compute_LWCN_graph_excluding_some_edges(capacity_sequence_edges,length_sequence_edges):
-    valid_edges = [
-        tuple(sorted((i, j)))
-        for (i, j) in sequence_edges
-        if i != "t" and j != "t" 
-           and i != "s" and j != "s" and not i.isdigit() and not j.isdigit()
-           and capacity_sequence_edges[tuple(sorted((i, j)))]>5
-        
-    ]
-    weight = sum(
-        capacity_sequence_edges[edge] * length_sequence_edges[edge]
-        for edge in valid_edges
-    )
-    return weight
 ######### Build the model
 def build_cycle_model(
                 G,
@@ -844,87 +904,86 @@ def build_cycle_model(
                 path_constraints,
                 enforce_connectivity,
                 gamma,
-                model_class=Model,
-                solver_api=GRB):
-    if model_class is None or solver_api is None:
-        raise RuntimeError(
-            "The Gurobi backend is unavailable. Install gurobipy or run with --solver highs."
-        )
-    model = model_class("ILP_CoRAL_cycle")
+                f_lower_bound=None):
+    model = Model("ILP_CoRAL_cycle")
+    model.setParam("Seed", RANDOM_SEED)
+    model.setParam("Threads", 1)
     # Decision variables   
-    X_concordant_edge = model.addVars(concordant_edges, vtype=solver_api.BINARY, name="X_concordant_edge")
-    X_discordant_edge = model.addVars(discordant_edges, vtype=solver_api.BINARY, name="X_discordant_edge")
-    X_sequence_edge = model.addVars(sequence_edges, vtype=solver_api.BINARY, name="X_sequence_edge")   
-    f_concordant_edge = model.addVars(concordant_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_concordant_edge")
-    f_discordant_edge = model.addVars(discordant_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_discordant_edge")
-    f_sequence_edge = model.addVars(sequence_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_sequence_edge")    
-    F = model.addVar(name="f_min", lb=0, vtype=solver_api.CONTINUOUS)  
-    P = model.addVars(len(path_constraints), vtype=solver_api.BINARY, name="P_path_constraint")
+    X_concordant_edge = model.addVars(stable_iter(concordant_edges), vtype=GRB.BINARY, name="X_concordant_edge")
+    X_discordant_edge = model.addVars(stable_iter(discordant_edges), vtype=GRB.BINARY, name="X_discordant_edge")
+    X_sequence_edge = model.addVars(stable_iter(sequence_edges), vtype=GRB.BINARY, name="X_sequence_edge")   
+    f_concordant_edge = model.addVars(stable_iter(concordant_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_concordant_edge")
+    f_discordant_edge = model.addVars(stable_iter(discordant_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_discordant_edge")
+    f_sequence_edge = model.addVars(stable_iter(sequence_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_sequence_edge")    
+    F = model.addVar(name="f_min", lb=0, vtype=GRB.CONTINUOUS)  
+    if f_lower_bound is not None:
+        model.addConstr(F >= f_lower_bound, name="F_UserLowerBound")
+    P = model.addVars(stable_iter(len(path_constraints)), vtype=GRB.BINARY, name="P_path_constraint")
     y_discordant = {}
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
-        for m in range(1, K_discordant_edges[edge_key] + 1):
-            y_discordant[edge_key + (m,)] = model.addVar(name=f"y_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=solver_api.BINARY)
+        for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1)):
+            y_discordant[edge_key + (m,)] = model.addVar(name=f"y_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=GRB.BINARY)
     z_discordant = {}
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
-        for m in range(1, K_discordant_edges[edge_key] + 1):
-            z_discordant[edge_key + (m,)] = model.addVar(lb=0, name=f"z_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=solver_api.CONTINUOUS)
+        for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1)):
+            z_discordant[edge_key + (m,)] = model.addVar(lb=0, name=f"z_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=GRB.CONTINUOUS)
 
     
     ### Objective function
     if len(path_constraints)>0:
-        multiplier= gamma* sum(capacity_sequence_edges[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges if i != 't' and j != 't')/ len(path_constraints)
+        multiplier= gamma* sum(capacity_sequence_edges[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in stable_iter(sequence_edges) if i != 't' and j != 't')/ len(path_constraints)
     else:
         multiplier=0
     
    ### Objective: Maximize total flow on sequence edges weighted by length and number of path constraints satisfied
     model.setObjective(
-        sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges if i != 't' and j != 't')+ multiplier*sum(P[k] for k in range(len(path_constraints))),
-        solver_api.MAXIMIZE
+        sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in stable_iter(sequence_edges) if i != 't' and j != 't')+ multiplier*sum(P[k] for k in stable_iter(range(len(path_constraints)))),
+        GRB.MAXIMIZE
     )
     # Constraint 1: Copy number of an edge ≤ capacity × selection variable (for undirected edges)
     
-    for (i, j) in concordant_edges:
+    for (i, j) in stable_iter(concordant_edges):
         edge = tuple(sorted((i, j)))
         model.addConstr(
             f_concordant_edge[edge] <= capacity_concordant_edges[edge] * X_concordant_edge[edge],
             name=f"ConcordantEdgeCapacity_{edge[0]}_{edge[1]}")    
-    for (i, j) in discordant_edges: 
+    for (i, j) in stable_iter(discordant_edges): 
         edge = tuple(sorted((i, j)))
         model.addConstr(
             f_discordant_edge[edge] <= capacity_discordant_edges[edge] * X_discordant_edge[edge],
             name=f"DiscordantEdgeCapacity_{edge[0]}_{edge[1]}")    
-    for (i, j) in sequence_edges: 
+    for (i, j) in stable_iter(sequence_edges): 
         edge = tuple(sorted((i, j)))
         model.addConstr(
             f_sequence_edge[edge] <= capacity_sequence_edges[edge] * X_sequence_edge[edge],
             name=f"SequenceEdgeCapacity_{edge[0]}_{edge[1]}")
     ### Constraint 3: copy number sequence edge incident = copy number discordant/concordant edge incident 
     ##########################################################################    
-    for k in nodes:
+    for k in stable_iter(nodes):
         if k in {"s", "t"}:
             continue
     
         # Define undirected incident edges
         incident_edges = {
           tuple(sorted((i, k)))
-          for i in nodes
+          for i in stable_iter(nodes)
           if tuple(sorted((i, k))) in concordant_edges | discordant_edges | sequence_edges and i != k}
         # Flow into k (sequence edges)
         flow_in_sequence = sum(
             f_sequence_edge[edge]
-            for edge in incident_edges
+            for edge in stable_iter(incident_edges)
             if edge in sequence_edges and k in edge)
     
         # Flow out of k (concordant + discordant)
         flow_out_concordant = sum(
             f_concordant_edge[edge]
-            for edge in incident_edges
+            for edge in stable_iter(incident_edges)
             if edge in concordant_edges and k in edge)
         flow_out_discordant = sum(
             f_discordant_edge[edge]
-            for edge in incident_edges
+            for edge in stable_iter(incident_edges)
             if edge in discordant_edges and k in edge)
     
         model.addConstr(
@@ -932,47 +991,47 @@ def build_cycle_model(
             name=f"FlowConservation2_{k}")
     ### Constraint 7 #Big-M constant (ensure it's large enough)    
     M = 1000000    
-    for edge in concordant_edges:
+    for edge in stable_iter(concordant_edges):
         i, j = edge
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             F <= f_concordant_edge[edge_key] + M * (1 - X_concordant_edge[edge_key]),
             name=f"ConcordantEdgeCapacity_{i}_{j}")    
-    for edge in discordant_edges:
+    for edge in stable_iter(discordant_edges):
         i, j = edge
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             F <= f_discordant_edge[edge_key] + M * (1 - X_discordant_edge[edge_key]),
             name=f"DiscordantEdgeCapacity_{i}_{j}")
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
-            sum(y_discordant[edge_key + (m,)] for m in range(1, K_discordant_edges[edge_key] + 1)) == X_discordant_edge[edge_key],
+            sum(y_discordant[edge_key + (m,)] for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1))) == X_discordant_edge[edge_key],
             name=f"one_multiple_discordant_{edge_key[0]}_{edge_key[1]}")
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
-        for m in range(1, K_discordant_edges[edge_key] + 1):
+        for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1)):
             z = z_discordant[edge_key + (m,)]
             y = y_discordant[edge_key + (m,)]
             model.addConstr(z <= F, name=f"z_leq_fmin_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z <= M * y, name=f"z_leq_My_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z >= F - M * (1 - y), name=f"z_geq_fmin_minus_M_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z >= 0, name=f"z_geq_0_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
-            f_discordant_edge[edge_key] == sum(m * z_discordant[edge_key + (m,)] for m in range(1, K_discordant_edges[edge_key] + 1)),
+            f_discordant_edge[edge_key] == sum(m * z_discordant[edge_key + (m,)] for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1))),
             name=f"flow_def_discordant_{edge_key[0]}_{edge_key[1]}")
     #### Constarints 9 Path constraints
-    for (i, j, k) in p_sequence_edges:
+    for (i, j, k) in stable_iter(p_sequence_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             X_sequence_edge[edge_key] >= P[k] * p_sequence_edges[(i, j, k)])
-    for (i, j, k) in p_concordant_edges:
+    for (i, j, k) in stable_iter(p_concordant_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             X_concordant_edge[edge_key] >= P[k] * p_concordant_edges[(i, j, k)])
-    for (i, j, k) in p_discordant_edges:
+    for (i, j, k) in stable_iter(p_discordant_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             X_discordant_edge[edge_key] >= P[k] * p_discordant_edges[(i, j, k)])
@@ -983,25 +1042,25 @@ def build_cycle_model(
         #####################################################
         all_edges = concordant_edges | discordant_edges | sequence_edges
         # Generate all directed versions of directed variables on undirected edges
-        directed_sequence_edges = {(u, v) for u, v in sequence_edges} | {(v, u) for u, v in sequence_edges}
-        directed_concordant_edges = {(u, v) for u, v in concordant_edges} | {(v, u) for u, v in concordant_edges}
-        directed_discordant_edges = {(u, v) for u, v in discordant_edges} | {(v, u) for u, v in discordant_edges}
-        c_seq  = model.addVars(directed_sequence_edges,   vtype=solver_api.BINARY, name="c_seq")
-        c_conc = model.addVars(directed_concordant_edges, vtype=solver_api.BINARY, name="c_conc")
-        c_disc = model.addVars(directed_discordant_edges, vtype=solver_api.BINARY, name="c_disc")
-        d = model.addVars(G.nodes, vtype=solver_api.INTEGER, lb=0, ub=len(G.nodes), name="d")
+        directed_sequence_edges = {(u, v) for u, v in stable_iter(sequence_edges)} | {(v, u) for u, v in stable_iter(sequence_edges)}
+        directed_concordant_edges = {(u, v) for u, v in stable_iter(concordant_edges)} | {(v, u) for u, v in stable_iter(concordant_edges)}
+        directed_discordant_edges = {(u, v) for u, v in stable_iter(discordant_edges)} | {(v, u) for u, v in stable_iter(discordant_edges)}
+        c_seq  = model.addVars(stable_iter(directed_sequence_edges),   vtype=GRB.BINARY, name="c_seq")
+        c_conc = model.addVars(stable_iter(directed_concordant_edges), vtype=GRB.BINARY, name="c_conc")
+        c_disc = model.addVars(stable_iter(directed_discordant_edges), vtype=GRB.BINARY, name="c_disc")
+        d = model.addVars(stable_iter(G.nodes), vtype=GRB.INTEGER, lb=0, ub=len(G.nodes), name="d")
         
         ##### Connectivity constraints for s and t  Constraint  "s" and "t" edges and the copy number of their incident edges
         flow_out_s_discordant = sum(
                 f_discordant_edge[tuple(sorted(("s", k)))]
-                for k in nodes
+                for k in stable_iter(nodes)
                 if tuple(sorted(("s", k))) in discordant_edges
             )
             
             ### Total flow into sink 't' on discordant edges
         flow_in_t_sequence = sum(
                 f_sequence_edge[tuple(sorted((k, "t")))]
-                for k in nodes
+                for k in stable_iter(nodes)
                 if tuple(sorted((k, "t"))) in sequence_edges
             )
             
@@ -1014,7 +1073,7 @@ def build_cycle_model(
         model.addConstr(
                 sum(
                     X_discordant_edge[tuple(sorted(("s", k)))]
-                    for k in nodes
+                    for k in stable_iter(nodes)
                     if tuple(sorted(("s", k))) in discordant_edges
                 ) == 1,
                 name="OneEdgeOutOfS"
@@ -1023,13 +1082,13 @@ def build_cycle_model(
         model.addConstr(
                 sum(
                     X_sequence_edge[tuple(sorted((k, "t")))]
-                    for k in nodes
+                    for k in stable_iter(nodes)
                     if tuple(sorted((k, "t"))) in sequence_edges
                 ) == 1,
                 name="OneEdgeIntoT"
             )
         #if node in {'s', 't'} or (isinstance(node, str) and node.isdigit()):
-        for k in nodes:
+        for k in stable_iter(nodes):
             if k in {"s", "t"} or k.isdigit():
                continue
             model.addConstr(
@@ -1044,7 +1103,7 @@ def build_cycle_model(
         ##### y_minu('s', every other node)=0, y_plus(every other node,'s')=0
         ###################################################### 
        
-        for u, v in directed_discordant_edges:
+        for u, v in stable_iter(directed_discordant_edges):
             if u != 's':
                 continue
             edge = tuple(sorted((u, v)))  # Get the undirected version
@@ -1072,9 +1131,9 @@ def build_cycle_model(
         ######################################################
         num_nodes = len(G.nodes)
     
-        for u in G.nodes:
+        for u in stable_iter(G.nodes):
             incident_x_vars = []
-            for v in G.neighbors(u):
+            for v in stable_iter(G.neighbors(u)):
                 edge = tuple(sorted((u, v)))
                 if edge in sequence_edges:
                     incident_x_vars.append(X_sequence_edge[edge])
@@ -1091,15 +1150,15 @@ def build_cycle_model(
         ###### Connectivity constraint 2 ##################
         ###################################################
                             
-        for u, v in sequence_edges:
+        for u, v in stable_iter(sequence_edges):
             edge = tuple(sorted((u, v)))
             model.addConstr(c_seq[u, v] + c_seq[v, u] <= X_sequence_edge[(u, v)], name=f"dir_seq_use_{u}_{v}")
         
-        for u, v in concordant_edges:
+        for u, v in stable_iter(concordant_edges):
             edge = tuple(sorted((u, v)))
             model.addConstr(c_conc[u, v] + c_conc[v, u] <= X_concordant_edge[(u, v)], name=f"dir_conc_use_{u}_{v}")
         
-        for u, v in discordant_edges:
+        for u, v in stable_iter(discordant_edges):
             edge = tuple(sorted((u, v)))
             model.addConstr(c_disc[u, v] + c_disc[v, u] <= X_discordant_edge[(u, v)], name=f"dir_disc_use_{u}_{v}")
         
@@ -1107,12 +1166,12 @@ def build_cycle_model(
         ######### Connectivity constraint 3 ###############
         ###################################################
         all_nodes = list(G.nodes)
-        for u in all_nodes:
+        for u in stable_iter(all_nodes):
             if u == 's':
                 continue  # skip source
             incoming_c = []
     
-            for v in all_nodes:
+            for v in stable_iter(all_nodes):
                 if (v, u) in c_seq:
                     incoming_c.append(c_seq[v, u])
                 if (v, u) in c_conc:
@@ -1124,7 +1183,7 @@ def build_cycle_model(
         
             # Compute total x variables that involve u (undirected edge participation)
             x_incident = []
-            for v in G.neighbors(u):
+            for v in stable_iter(G.neighbors(u)):
                 edge = tuple(sorted((u, v)))  # undirected
                 if edge in X_sequence_edge:
                     x_incident.append(X_sequence_edge[edge])
@@ -1145,19 +1204,19 @@ def build_cycle_model(
         ######### Connectivity constraint 4 ###############
         ###################################################
                         
-        for u, v in directed_sequence_edges:
+        for u, v in stable_iter(directed_sequence_edges):
             if (u, v) in c_seq:
                 model.addConstr(
                     d[v] - d[u] + num_nodes * (1 - c_seq[u, v]) >= 1,
                     name=f"d_order_sequence_{u}_{v}"
                 )
-        for u, v in directed_concordant_edges:
+        for u, v in stable_iter(directed_concordant_edges):
             if (u, v) in c_conc:
                 model.addConstr(
                     d[v] - d[u] + num_nodes * (1 - c_conc[u, v]) >= 1,
                     name=f"d_order_concordant_{u}_{v}"
                 )
-        for u, v in directed_discordant_edges:
+        for u, v in stable_iter(directed_discordant_edges):
             if (u, v) in c_disc:
                 model.addConstr(
                     d[v] - d[u] + num_nodes * (1 - c_disc[u, v]) >= 1,
@@ -1178,15 +1237,6 @@ def build_cycle_model(
         "y_discordant": y_discordant,
         "z_discordant": z_discordant,
     }
-
-
-def build_cycle_model_highs(*args, **kwargs):
-    """Build the cycle MILP with the HiGHS backend."""
-    kwargs["model_class"] = HighsModel
-    kwargs["solver_api"] = HighsGRB
-    return build_cycle_model(*args, **kwargs)
-
-
 ########## Some small functions to use in the Heuristic later
 
 
@@ -1201,13 +1251,13 @@ def is_edge_type_alternating(walk):
     # 'sequence edge' and ('discordant edge' or 'concordant edge')
     # Nodes are ignored.
 
-    edge_sequence = [label for (label, _) in walk if "edge" in label]
+    edge_sequence = [label for (label, _) in stable_iter(walk) if "edge" in label]
     if not edge_sequence:
         return True  # Nothing to validate
     
     expected = "sequence edge" if edge_sequence[0] == "sequence edge" else "non-sequence"
     
-    for label in edge_sequence:
+    for label in stable_iter(edge_sequence):
         if expected == "sequence edge":
             if label != "sequence edge":
                 return False
@@ -1224,17 +1274,17 @@ def find_and_rotate_walk(walk1, walk2):
     # Try merging walk2 into walk1 at shared nodes,
     # testing both entry directions, and preserve edge-type alternation.
 
-    nodes1 = {entry[1] for entry in walk1 if entry[0] == "node"}
-    shared_indices = [(i, entry[1]) for i, entry in enumerate(walk2)
+    nodes1 = {entry[1] for entry in stable_iter(walk1) if entry[0] == "node"}
+    shared_indices = [(i, entry[1]) for i, entry in stable_iter(enumerate(walk2))
                       if entry[0] == "node" and entry[1] in nodes1]
 
     if not shared_indices:
         print("⚠️ Warning: No shared node found. Skipping merge.")
         return walk1
 
-    for shared_index, shared_node in shared_indices:
+    for shared_index, shared_node in stable_iter(shared_indices):
        # for offset in (0, -2): # in daghighan roo shared node shoroonemikard vase hamin bazi vaghta javab ghalat midad. masalan 2 ta node posht sare ham midad
-        for offset in (0,):    
+        for offset in stable_iter((0,)):    
             walk2_copy = walk2[:]
 
             # Handle redundant closure
@@ -1253,7 +1303,7 @@ def find_and_rotate_walk(walk1, walk2):
             rotated.append(("node", shared_node))  # Always close the loop
 
             # Insert rotated walk2 at shared_node in walk1
-            insert_index = next(i for i, (lbl, node) in enumerate(walk1)
+            insert_index = next(i for i, (lbl, node) in stable_iter(enumerate(walk1))
                                 if lbl == "node" and node == shared_node)
 
             merged_candidate = walk1[:insert_index + 1] + rotated + walk1[insert_index + 1:]
@@ -1267,7 +1317,7 @@ def find_and_rotate_walk(walk1, walk2):
             middle = rotated[:-1]
             reversed_middle = []
             # reverse the order of edges + nodes (node after edge becomes node before edge)
-            for i in range(len(middle)-1, 0, -2):
+            for i in stable_iter(range(len(middle)-1, 0, -2)):
                 reversed_middle.append(middle[i])      # node
                 reversed_middle.append(middle[i-1])    # edge
             # print("reversed middle walk2 beofre append: ", reversed_middle)
@@ -1289,7 +1339,7 @@ def create_closed_walks(sequence_edges, f_sequence_edge, discordant_edges, f_dis
                      concordant_edges, f_concordant_edge, max_attempts,segments, F):
     
     node_to_segment_id = {}
-    for seg_id, info in segments.items():
+    for seg_id, info in stable_iter(segments.items()):
         node_start = f"{info['chrom']}:{info['start']}-"
         node_end = f"{info['chrom']}:{info['end']}+"
         node_to_segment_id[node_start] = seg_id
@@ -1301,7 +1351,7 @@ def create_closed_walks(sequence_edges, f_sequence_edge, discordant_edges, f_dis
         )
     # Filter and normalize undirected sequence edges
     solution_sequence_edges = []
-    for (i, j) in sequence_edges:
+    for (i, j) in stable_iter(sequence_edges):
         if i == 't' or j == 't':
            continue  # This happens only if we enforce connectivity, I find this if check eaiser than the enforce connectivity flag 
         if f_sequence_edge[i, j] > 0:
@@ -1312,7 +1362,7 @@ def create_closed_walks(sequence_edges, f_sequence_edge, discordant_edges, f_dis
     #     print(edge)
         
     solution_discordant_edges = []
-    for (i, j) in discordant_edges:
+    for (i, j) in stable_iter(discordant_edges):
         if i == 's' or j == 's':
            continue  # This happens only if we enforce connectivity, I find this if check eaiser than the enforce connectivity flag 
         if f_discordant_edge[i, j] > 0:
@@ -1323,7 +1373,7 @@ def create_closed_walks(sequence_edges, f_sequence_edge, discordant_edges, f_dis
     #     print(edge)
         
     solution_concordant_edges = []
-    for (i, j) in concordant_edges:
+    for (i, j) in stable_iter(concordant_edges):
         if f_concordant_edge[i, j] > 0:
             multiplicity = round(f_concordant_edge[i, j] / F)
             solution_concordant_edges.extend([tuple(sorted((i, j)))] * multiplicity)
@@ -1366,7 +1416,7 @@ def create_closed_walks(sequence_edges, f_sequence_edge, discordant_edges, f_dis
     
             #     first_walk = False
             # else:
-            start_edge = random.choice(list(remaining_sequence_edges.elements()))
+            start_edge = random.choice(sorted(list(remaining_sequence_edges.elements())))
     
             ordered_closed_walk = [
                 ("node", start_edge[0]),
@@ -1398,17 +1448,17 @@ def create_closed_walks(sequence_edges, f_sequence_edge, discordant_edges, f_dis
                     match = None
                     # Combine discordant and concordant edges into one list
                     candidate_edges = [
-                        ("discordant edge", edge) for edge in remaining_discordant_edges.elements()
+                        ("discordant edge", edge) for edge in stable_iter(remaining_discordant_edges.elements())
                     ] + [
-                        ("concordant edge", edge) for edge in remaining_concordant_edges.elements()
+                        ("concordant edge", edge) for edge in stable_iter(remaining_concordant_edges.elements())
                     ]
                     
                     
                     #### Pick randomly 
-                    candidate_edges = [x for x in candidate_edges if current_node in x[1]]
+                    candidate_edges = [x for x in stable_iter(candidate_edges) if current_node in x[1]]
                     
                     if candidate_edges:
-                        match = random.choice(candidate_edges)
+                        match = random.choice(sorted(candidate_edges))
                         edge_label, edge = match
                         if edge_label == "discordant edge":
                             use_edge(remaining_discordant_edges, edge)
@@ -1430,10 +1480,10 @@ def create_closed_walks(sequence_edges, f_sequence_edge, discordant_edges, f_dis
                 elif edge_type == "sequence":
                     match = None
                     
-                    candidate_edges = [edge for edge in remaining_sequence_edges.elements() if current_node in edge]
+                    candidate_edges = [edge for edge in stable_iter(remaining_sequence_edges.elements()) if current_node in edge]
                     
                     if candidate_edges:
-                        match = random.choice(candidate_edges)  # pick one randomly
+                        match = random.choice(sorted(candidate_edges))  # pick one randomly
                         use_edge(remaining_sequence_edges, match)
                     else:
                         break
@@ -1455,7 +1505,7 @@ def create_closed_walks(sequence_edges, f_sequence_edge, discordant_edges, f_dis
         # --- Evaluate correctness after each attempt ---
         all_walks_closed = all(
             walk[0][1] == walk[-1][1]
-            for walk in all_closed_walks
+            for walk in stable_iter(all_closed_walks)
         )
     
         all_edges_used = (
@@ -1488,7 +1538,7 @@ def merge_all_closed_walks(walks):
     merged_walk = walks[0]
     not_merged_walks = []
 
-    for next_walk in walks[1:]:
+    for next_walk in stable_iter(walks[1:]):
         old_merged = merged_walk
         merged_candidate = find_and_rotate_walk(merged_walk, next_walk)
 
@@ -1522,7 +1572,7 @@ def test_closed_walk(walk):
     prev_type = None
     prev_edge_type = None
 
-    for i, entry in enumerate(walk):
+    for i, entry in stable_iter(enumerate(walk)):
         entry_type, label = entry
 
         # Rule 2 & 3: No two nodes or two edges in a row
@@ -1552,7 +1602,7 @@ def test_merged_closed_walk(walk, sequence_edges, f_sequence_edge, discordant_ed
     
     # Filter and normalize undirected sequence edges
     number_of_sequence_edges_in_solution = 0
-    for (i, j) in sequence_edges:
+    for (i, j) in stable_iter(sequence_edges):
         if Path == False:
             if i == "t" or j == "t": # when we enforce connectivity we should not count seq edge connected to t for a closed walk, 
                 continue
@@ -1561,7 +1611,7 @@ def test_merged_closed_walk(walk, sequence_edges, f_sequence_edge, discordant_ed
             number_of_sequence_edges_in_solution += multiplicity    
             
     number_of_discordant_edges_in_solution = 0
-    for (i, j) in discordant_edges:
+    for (i, j) in stable_iter(discordant_edges):
         if Path == False:
             if i == "s" or j == "s": # when we enforce connectivity we should not count disc edge connected to s for a closed walk but we should consider it for a path which is a s-t-walk
                 continue
@@ -1570,7 +1620,7 @@ def test_merged_closed_walk(walk, sequence_edges, f_sequence_edge, discordant_ed
             number_of_discordant_edges_in_solution += multiplicity   
     
     number_of_concordant_edges_in_solution = 0
-    for (i, j) in concordant_edges:
+    for (i, j) in stable_iter(concordant_edges):
         # if i == "t" or j == "t":
         #     continue
         if f_concordant_edge[i, j] > 0:
@@ -1584,31 +1634,60 @@ def test_merged_closed_walk(walk, sequence_edges, f_sequence_edge, discordant_ed
        return False
 
 ########## In case od two disconnected cycles, we might be able to increase the CN of one of them
-def Increase_CN(walk, F, capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges):
-    capacities_of_all_edge_types_in_walk = []
+def increase_component_copy_number(walk, base_F, capacity_sequence_edges,
+                                   capacity_concordant_edges, capacity_discordant_edges,
+                                   f_sequence_edge, f_concordant_edge, f_discordant_edge,
+                                   log_context="Component"):
+    """Maximize this component's CN while reserving all other solution flow.
 
-    for edge_type, edge in walk:
-        if edge_type == 'sequence edge':
-            cap = capacity_sequence_edges.get(edge, 0)
-        elif edge_type == 'concordant edge':
-            cap = capacity_concordant_edges.get(edge, 0)
-        elif edge_type == 'discordant edge':
-            cap = capacity_discordant_edges.get(edge, 0)
-        else:
-            continue  # ignore nodes etc.
-        
-        if cap > 0:  # only consider positive capacities
-            capacities_of_all_edge_types_in_walk.append(cap)
-
-    if not capacities_of_all_edge_types_in_walk:
-        return 0.0  # no positive capacities
-
-    min_capacity = min(capacities_of_all_edge_types_in_walk)
-    print("min capacity is:", min_capacity)
-    print("F is:", F)
-
-    delta_F = max(0.0, min_capacity - F)
-    return delta_F
+    Capacities are residual graph capacities before subtracting this iteration.
+    Flow dictionaries are updated in place. Repeated traversals consume capacity
+    once per traversal, and edge types remain distinct.
+    """
+    capacities = {
+        "sequence edge": capacity_sequence_edges,
+        "concordant edge": capacity_concordant_edges,
+        "discordant edge": capacity_discordant_edges,
+    }
+    flows = {
+        "sequence edge": f_sequence_edge,
+        "concordant edge": f_concordant_edge,
+        "discordant edge": f_discordant_edge,
+    }
+    counts = Counter(
+        (kind, tuple(sorted(edge))) for kind, edge in stable_iter(walk) if kind in capacities
+    )
+    if base_F <= 0:
+        raise ValueError("Component base copy number must be positive")
+    if not counts:
+        raise ValueError("Cannot increase an empty component")
+    delta = float("inf")
+    for (kind, edge), multiplicity in stable_iter(counts.items()):
+        capacity = capacities[kind][edge]
+        flow = flows[kind][edge]
+        tolerance = 1e-6 * max(1.0, abs(capacity), abs(flow))
+        if flow > capacity + tolerance:
+            raise ValueError(f"Solution already exceeds capacity on {kind} {edge}")
+        if multiplicity * base_F > flow + tolerance:
+            raise ValueError(f"Reconstructed traversal count exceeds solution flow on {kind} {edge}")
+        # Existing flow includes this component and every other component.
+        delta = min(delta, max(0.0, capacity - flow) / multiplicity)
+    if delta <= 1e-9:
+        delta = 0.0
+    if delta > 0:
+        print(f"\nDisconnected solution — {log_context}:")
+        print(f"Increasing component copy number from {base_F:.8f} to {base_F + delta:.8f} "
+              f"(increase: {delta:.8f}).")
+        print("Affected edges (flow increase = traversal count × component copy-number increase):")
+    for (kind, edge), multiplicity in sorted(counts.items()):
+        old_flow = flows[kind][edge]
+        increase = multiplicity * delta
+        flows[kind][edge] += increase
+        if delta > 0:
+            print(f"  {kind}: {edge[0]} -> {edge[1]}; traversals={multiplicity}; "
+                  f"flow {old_flow:.8f} -> {flows[kind][edge]:.8f}; "
+                  f"increase={increase:.8f}; capacity={capacities[kind][edge]:.8f}")
+    return base_F + delta, delta
 ########## parsing function
 def parse_node_colon_format(node_str):
     
@@ -1624,7 +1703,7 @@ def parse_node_colon_format(node_str):
 def convert_walk_to_segment_string(walk, segments, copy_count):
     segment_path = []
 
-    for i in range(len(walk)):
+    for i in stable_iter(range(len(walk))):
         entry = walk[i]
         if entry[0] != "sequence edge":
             continue
@@ -1646,7 +1725,7 @@ def convert_walk_to_segment_string(walk, segments, copy_count):
             continue
 
         #for seg_id, (seg_chrom, seg_start, seg_end) in segments.items():
-        for seg_id, seg_info in segments.items():
+        for seg_id, seg_info in stable_iter(segments.items()):
             seg_chrom = seg_info["chrom"]
             seg_start = seg_info["start"]
             seg_end   = seg_info["end"]
@@ -1669,7 +1748,7 @@ def convert_walk_to_segment_string(walk, segments, copy_count):
 #### check if any of the path constraints are subsequents of walks
 def add_e_prefix(walk_raw):
     #Convert ['2+','5-']  → ['e2+','e5-']  (keeps any existing prefix).
-    return [f"e{seg}" if seg and seg[0] not in "ecd" else seg for seg in walk_raw if seg]
+    return [f"e{seg}" if seg and seg[0] not in "ecd" else seg for seg in stable_iter(walk_raw) if seg]
 #################
 def reverse_complement(edge_list):
     if not edge_list:
@@ -1678,7 +1757,7 @@ def reverse_complement(edge_list):
 
     flip = {"+": "-", "-": "+"}
     result = []
-    for e in reversed(edge_list):
+    for e in stable_iter(reversed(edge_list)):
         if len(e) < 2 or e[-1] not in flip:
             print(f" Malformed edge label: '{e}' (expected format like 'e12+' or 'c5-')")
             continue  # or raise an error if you prefer to fail fast
@@ -1692,12 +1771,12 @@ def is_circular_subsequence(sub, seq):
         return False
 
     # Check all linear slices
-    for i in range(n - m + 1):
+    for i in stable_iter(range(n - m + 1)):
         if seq[i:i + m] == sub:
             return True
 
     # Now check wraparound (sub spans the end and the start)
-    for i in range(1, m):
+    for i in stable_iter(range(1, m)):
         # Last i elements + first (m-i) elements
         if seq[-i:] + seq[:m - i] == sub:
             return True
@@ -1708,7 +1787,7 @@ def match_e_constraints(walk_raw, path_constraints):
     walk_rc = reverse_complement(walk)
 
     matched = []
-    for pc in path_constraints:
+    for pc in stable_iter(path_constraints):
         if not (isinstance(pc, dict)
                 and isinstance(pc.get("constraint_string"), str)
                 and "index" in pc):
@@ -1726,8 +1805,7 @@ def match_e_constraints(walk_raw, path_constraints):
             matched.append(pc["index"])
 
     return matched
-
-
+######## These function are parsing
 def select_best_closed_walk(
         sequence_edges, f_sequence_edge,
         discordant_edges, f_discordant_edge,
@@ -1786,7 +1864,78 @@ def select_best_closed_walk(
             }
 
     return best_candidate
-######## These function are parsing
+
+
+def select_best_s_t_walk(
+        sequence_edges, f_sequence_edge,
+        discordant_edges, f_discordant_edge,
+        concordant_edges, f_concordant_edge,
+        segments, path_constraints, F, candidate_runs=100):
+    """Generate s-t candidates and retain the best validated path-constraint match."""
+    best_candidate = None
+    best_rank = None
+
+    for _ in range(candidate_runs):
+        s_t_walks, construction_error = create_s_t_walks(
+            sequence_edges, f_sequence_edge,
+            discordant_edges, f_discordant_edge,
+            concordant_edges, f_concordant_edge,
+            1, segments, F,
+        )
+        merged_walk, not_merged_walks = merge_all_closed_walks(s_t_walks)
+        primary_walk = merged_walk
+        if s_t_walks:
+            s_t_walks[0] = primary_walk
+        walk_is_complete = test_merged_closed_walk(
+            primary_walk,
+            sequence_edges, f_sequence_edge,
+            discordant_edges, f_discordant_edge,
+            concordant_edges, f_concordant_edge,
+            F, Path=True,
+        )
+        has_s_t_endpoints = (
+            bool(primary_walk)
+            and primary_walk[0] == ("node", "s")
+            and primary_walk[-1] == ("node", "t")
+            and is_edge_type_alternating(primary_walk)
+        )
+
+        segment_string = convert_s_t_walk_to_segment_string(
+            primary_walk[2:-2], segments, copy_count=F
+        )
+        segment_list = segment_string.split("Segments=", 1)[1].split(",")
+        if segment_list == [""]:
+            segment_list = []
+        matched_constraints = set(match_e_constraints(segment_list, path_constraints))
+
+        candidate_is_valid = (
+            construction_error == 0 and has_s_t_endpoints and walk_is_complete
+        )
+        rank = (
+            int(candidate_is_valid),
+            len(matched_constraints),
+            int(walk_is_complete),
+            int(has_s_t_endpoints),
+            -len(not_merged_walks),
+        )
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_candidate = {
+                "walks": s_t_walks,
+                "walk": primary_walk,
+                "merged_walk": merged_walk,
+                "not_merged_walks": not_merged_walks,
+                "construction_error": construction_error,
+                "endpoint_test": has_s_t_endpoints,
+                "completion_test": walk_is_complete,
+                "segment_string": segment_string,
+                "segments": segment_list,
+                "matched_constraints": matched_constraints,
+            }
+
+    return best_candidate
+
+
 def extract_chr(pos):
     #Extract 'chrN' from a string like 'chr3:20660863+', or use full string/int otherwise.
     if isinstance(pos, str):
@@ -1800,17 +1949,69 @@ def remove_chr_prefix(pos):
         return re.sub(r'^chr[\w]+:', '', pos)
     return str(pos)
 ######## Write the ILP output file
+def log_stopping_cutoffs(phase, iteration, F_value, accumulated_weight, graph_weight):
+    """Explain why this iteration is excluded from reconstructed output."""
+    reasons = []
+    if F_value < 0.5:
+        reasons.append(f"F = {F_value:.8f} < 0.5")
+    if accumulated_weight > 0.9 * graph_weight:
+        ratio = accumulated_weight / graph_weight if graph_weight else float("inf")
+        reasons.append(
+            f"accumulated solution LWCN = {accumulated_weight:.8f} "
+            f"> 90% of original graph LWCN = {graph_weight:.8f} "
+            f"(ratio = {ratio:.2%})"
+        )
+    if reasons:
+        print(f"STOPPING CRITERIA REACHED — Iteration {iteration}, {phase} extraction: "
+              + "; ".join(reasons))
+        print(f"The current {phase.lower()} solution is NOT included in the reconstructed output "
+              "and its flow is NOT subtracted from the graph. Previously accepted results are retained.")
+        print("Proceeding to path extraction." if phase == "Cycle"
+              else "Writing the collected cycles and paths to the output.")
+
+
+def print_iteration_solution(iteration, phase, model, F_value,
+                             sequence_flows, sequence_selections, sequence_lengths,
+                             concordant_flows, concordant_selections,
+                             discordant_flows, discordant_selections):
+    """Print the raw solver solution before component CN increases, without K."""
+    print(f"\nIteration {iteration} {phase} solution:")
+    print(f"Solver status: {model.Status}; F: {F_value:.8f}")
+    print("Raw solver flows, before component copy-number increases.")
+    print(f"{'Edge':<15}{'chr':<25}{'Start position':<22}{'End position':<22}{'X':>6}{'Flow':>18}{'Length':>14}")
+    print("=" * 122)
+    groups = [
+        ("Sequence", sequence_flows, sequence_selections, sequence_lengths),
+        ("Concordant", concordant_flows, concordant_selections, {}),
+        ("Discordant", discordant_flows, discordant_selections, {}),
+    ]
+    for label, flows, selections, lengths in groups:
+        for edge in sorted(flows):
+            flow, selected = flows[edge], selections[edge]
+            if selected <= 0.5 and abs(flow) <= 1e-8:
+                continue
+            start, end = edge
+            chr_a, sep_a, pos_a = start.partition(":")
+            chr_b, sep_b, pos_b = end.partition(":")
+            amplicon = chr_a if chr_a == chr_b else f"{chr_a}->{chr_b}"
+            start_pos = pos_a if sep_a else start
+            end_pos = pos_b if sep_b else end
+            length = str(lengths[edge]) if edge in lengths else "-"
+            print(f"{label:<15}{amplicon:<25}{start_pos:<22}{end_pos:<22}{selected:>6.1f}{flow:>18.8f}{length:>14}")
+    print("=" * 122)
+
+
 def write_ILP_output(output_path,model,sequence_edges,f_sequence_edge,X_sequence_edge,concordant_edges,f_concordant_edge,
                      X_concordant_edge,discordant_edges,f_discordant_edge, X_discordant_edge,P,path_constraints):
     eps = 1e-5
     with open(output_path, "w") as f:
-        if optimization_model_is_optimal(model):
+        if model.status == GRB.OPTIMAL:
             f.write(f"Optimization took {end_time - start_time:.2f} seconds.\n")
             # Header with the new "X" column
             f.write(f"{'Edge':<15}{'Amplicon':<15}{'Start position':<20}{'End position':<20}{'X':<12}{'Flow':<10}{'Length':<12}{'K':<8}\n")
             f.write("=" * 120 + "\n")
     
-            for (i, j) in sequence_edges:
+            for (i, j) in stable_iter(sequence_edges):
                 if f_sequence_edge[i, j] > eps:
                  # if i != "t" and j != "t":
                     chrom = extract_chr(i)
@@ -1820,7 +2021,7 @@ def write_ILP_output(output_path,model,sequence_edges,f_sequence_edge,X_sequence
                     X_value = X_sequence_edge[i, j]
                     f.write(f"{'Sequence':<15}{chrom:<15}{start:<20}{end:<20}{X_sequence_edge[i, j]:<12.1f}{f_sequence_edge[i, j]:<10.1f}{length_sequence_edges[i, j]:<12.1f}\n")
             f.write("=" * 120 + "\n")
-            for (i, j) in concordant_edges:
+            for (i, j) in stable_iter(concordant_edges):
                 if f_concordant_edge[i, j] > eps:
                     chrom = extract_chr(i)
                     start = remove_chr_prefix(i)
@@ -1839,7 +2040,7 @@ def write_ILP_output(output_path,model,sequence_edges,f_sequence_edge,X_sequence
             #         X_value = X_discordant_edge[i, j].x
             #         f.write(f"{'Discordant':<15}{chrom:<15}{start:<20}{end:<20}{X_discordant_edge[i, j].x:<12.1f}{f_discordant_edge[i, j].x:<10.1f}\n")
             f.write("=" * 120 + "\n")
-            for (i, j) in discordant_edges:
+            for (i, j) in stable_iter(discordant_edges):
                 if f_discordant_edge[i, j] > eps:
                 #  if i != "s" and j != "s":
                     chrom = extract_chr(i)
@@ -1858,7 +2059,7 @@ def write_ILP_output(output_path,model,sequence_edges,f_sequence_edge,X_sequence
             
             f.write("\nSatisfied path constraints :\n")
             f.write("=" * 50 + "\n")
-            for k in range(len(path_constraints)):
+            for k in stable_iter(range(len(path_constraints))):
                 if P[k] > 0.5:  # Check if path constraint k is satisfied
                     support = path_constraints[k]["support"]
                     path_str = ", ".join(path_constraints[k]["paths"])
@@ -1881,7 +2082,7 @@ def write_ILP_cycle_file(segments, new_output_file,final_segment_str, Iteration,
         with open(new_output_file, "w") as out_f:
             out_f.write("List of cycle segments\n")
 
-            for seg_id in sorted(segments.keys()):
+            for seg_id in stable_iter(sorted(segments.keys())):
                 seg = segments[seg_id]
                 out_f.write(
                     f"Segment\t{seg['id']}\t{seg['chrom']}\t{seg['start']}\t{seg['end']}\n"
@@ -1891,7 +2092,7 @@ def write_ILP_cycle_file(segments, new_output_file,final_segment_str, Iteration,
             out_f.write("List of longest subpath constraints\n")
 
             # Write constraints with satisfaction status
-            for pc in Path_Constraints:
+            for pc in stable_iter(Path_Constraints):
                 status = "Satisfied" if pc["index"] in matched_index_set else "Unsatisfied"
                 out_f.write(
                     f"Path constraint\t{pc['index']}\t{pc['constraint_string']}"
@@ -1903,7 +2104,7 @@ def write_ILP_cycle_file(segments, new_output_file,final_segment_str, Iteration,
 
             # Write first cycle
             out_f.write(final_segment_str)
-            path_str = ",".join(str(i) for i in sorted(matched_index_set))
+            path_str = ",".join(str(i) for i in stable_iter(sorted(matched_index_set)))
             out_f.write(f";Path_constraints_satisfied={path_str}\n")
 
     # --------------- CASE 2: SUBSEQUENT ITERATIONS ------------
@@ -1912,7 +2113,7 @@ def write_ILP_cycle_file(segments, new_output_file,final_segment_str, Iteration,
 
             # Append new cycle only
             out_f.write(final_segment_str)
-            path_str = ",".join(str(i) for i in sorted(matched_index_set))
+            path_str = ",".join(str(i) for i in stable_iter(sorted(matched_index_set)))
             out_f.write(f";Path_constraints_satisfied={path_str}\n")
             
 ####### Write the meesage about the solutions 
@@ -1963,7 +2164,7 @@ def compute_Length_weighted_copy_number_solution(sequence_edges,f_sequence_edge,
     #     if i != "t" and j != "t" and i != "s" and j != "s" and not i.isdigit() and not j.isdigit()
     # ]
     # # Remove duplicates in case (i, j) and (j, i) both appear
-    # valid_edges = list(set(valid_edges))
+    # valid_edges = sorted(set(valid_edges))
     
     # weight_of_solution = sum(
     #     f_sequence_edge[edge] * length_sequence_edges[edge]
@@ -1971,73 +2172,33 @@ def compute_Length_weighted_copy_number_solution(sequence_edges,f_sequence_edge,
     # )
     # 1️⃣ Extract only the sequence edges from Final_closed_walk
     walk_sequence_edges = [
-        edge for (etype, edge) in Final_closed_walk
+        edge for (etype, edge) in stable_iter(Final_closed_walk)
         if etype == "sequence edge"
     ]
 
     # 2️⃣ Normalize the edges (sorted tuples) to match keys in f_sequence_edge / length_sequence_edges
     valid_edges = [
         tuple(sorted(edge))
-        for edge in walk_sequence_edges
+        for edge in stable_iter(walk_sequence_edges)
         if edge[0] not in ("s", "t") and edge[1] not in ("s", "t")
            and not edge[0].isdigit() and not edge[1].isdigit()
     ]
 
     # 3️⃣ Remove duplicates in case of reverse direction
-    valid_edges = list(set(valid_edges))
+    valid_edges = sorted(set(valid_edges))
 
     # 4️⃣ Sum up weight
     weight_of_solution = sum(
         f_sequence_edge[e] * length_sequence_edges[e]
-        for e in valid_edges
+        for e in stable_iter(valid_edges)
         if e in f_sequence_edge and e in length_sequence_edges
     )
     
     return weight_of_solution                
 ###### compute Length weighted copy number solution, here we do not consider seq edges with CN<5. (THE CN of the graph)
-def compute_LWCN_solution_excludeing_some_segments(capacity_sequence_edges,sequence_edges,f_sequence_edge,length_sequence_edges, Final_closed_walk):
-    # valid_edges = [
-    #     tuple(sorted((i, j)))
-    #     for (i, j) in sequence_edges
-    #     if i != "t" and j != "t" and i != "s" and j != "s" and not i.isdigit() and not j.isdigit()
-    # ]
-    # # Remove duplicates in case (i, j) and (j, i) both appear
-    # valid_edges = list(set(valid_edges))
-    
-    # weight_of_solution = sum(
-    #     f_sequence_edge[edge] * length_sequence_edges[edge]
-    #     for edge in valid_edges
-    # )
-    # 1️⃣ Extract only the sequence edges from Final_closed_walk
-    walk_sequence_edges = [
-        edge for (etype, edge) in Final_closed_walk
-        if etype == "sequence edge"
-    ]
-
-    # 2️⃣ Normalize the edges (sorted tuples) to match keys in f_sequence_edge / length_sequence_edges
-    valid_edges = [
-        tuple(sorted(edge))
-        for edge in walk_sequence_edges
-        if edge[0] not in ("s", "t") and edge[1] not in ("s", "t")
-           and not edge[0].isdigit() and not edge[1].isdigit()
-           and capacity_sequence_edges[edge]>5
-    ]
-
-    # 3️⃣ Remove duplicates in case of reverse direction
-    valid_edges = list(set(valid_edges))
-
-    # 4️⃣ Sum up weight
-    weight_of_solution = sum(
-        f_sequence_edge[e] * length_sequence_edges[e]
-        for e in valid_edges
-        if e in f_sequence_edge and e in length_sequence_edges
-    )
-    
-    return weight_of_solution
 ############# write the LWCN of cycles in LWCN output file
 def write_LWCN_cycle_in_file(metrics_output_path
                              ,weight_cycle_ILP,weight_graph,weight_ratio_cycle_ILP, length_cycle_ILP
-                             ,weight_cycle_ILP_excluding_some_segments,weight_graph_excluding_some_segments,weight_ratio_cycle_ILP_excluding_some_segments, length_cycle_ILP_excluding_some_segments
                              ,F,Iteration,Num_paths):
     #with open(metrics_output_path, "a") as f:
         # Only write Coral cycle info for the first iteration
@@ -2052,10 +2213,6 @@ def write_LWCN_cycle_in_file(metrics_output_path
                 #     f.write(f"{'length weighted copy number of (original) graph':<40}: {weight_graph:.2f}\n")
                 #     f.write(f"{'Weight ratio of reconstructed cycle':<35}: {cycle['weight_ratio']:.4f}\n")
                     
-                #     f.write(f"{'length of reconstructed cycle excluding some segments':<40}: {cycle['Length_excluding_segments']:.2f}\n")
-                #     f.write(f"{'length weighted copy number of reconstructed cycle excluding some segments':<40}: {cycle['weight_excluding_segments']:.2f}\n")
-                #     f.write(f"{'length weighted copy number of (original) graph excluding some segments':<40}: {weight_graph_excluding_some_segments:.2f}\n")
-                #     f.write(f"{'weight ratio of reconstructed cycle excluding some segments':<40}: {cycle['weight_ratio_excluding_segments']:.4f}\n")
 
                 #     f.write("\n")
                 # for j, path in enumerate(path_weights, start=1):
@@ -2066,10 +2223,6 @@ def write_LWCN_cycle_in_file(metrics_output_path
                 #     f.write(f"{'length weighted copy number of (original) graph':<40}: {weight_graph:.2f}\n")
                 #     f.write(f"{'Weight ratio of reconstructed path':<35}: {path['weight_ratio']:.4f}\n")
                     
-                #     f.write(f"{'length of reconstructed path excluding some segments':<40}: {path['Length_excluding_segments']:.2f}\n")
-                #     f.write(f"{'length weighted copy number of reconstructed path excluding some segments':<40}: {path['weight_excluding_segments']:.2f}\n")
-                #     f.write(f"{'length weighted copy number of (original) graph excluding some segments':<40}: {weight_graph_excluding_some_segments:.2f}\n")
-                #     f.write(f"{'weight ratio of reconstructed path excluding some segments':<40}: {path['weight_ratio_excluding_segments']:.4f}\n")
 
                     
                 #     f.write("\n")
@@ -2084,11 +2237,6 @@ def write_LWCN_cycle_in_file(metrics_output_path
                 f.write(f"{'weight ratio of ILP cycle':<40}: {weight_ratio_cycle_ILP[Iteration-Num_paths-1]:.4f}\n")
                 #f.write(f"{'weight ratio of ILP cycle':<40}: {weight_ratio_cycle_ILP[Iteration-1]:.4f}\n")
 
-                f.write(f"{'length of ILP cycle excluding some segments':<40}: {length_cycle_ILP_excluding_some_segments:.2f}\n")
-                f.write(f"{'length weighted copy number of ILP cycle excluding some segments':<40}: {weight_cycle_ILP_excluding_some_segments:.2f}\n")
-                f.write(f"{'length weighted copy number of (original) graph excluding some segments':<40}: {weight_graph_excluding_some_segments:.2f}\n")
-                f.write(f"{'weight ratio of ILP cycle excluding some segments':<40}: {weight_ratio_cycle_ILP_excluding_some_segments[Iteration-Num_paths-1]:.4f}\n")
-                #f.write(f"{'weight ratio of ILP cycle excluding some segments':<40}: {weight_ratio_cycle_ILP_excluding_some_segments[Iteration-1]:.4f}\n")
 
                 f.write("\n")
         else:
@@ -2102,11 +2250,6 @@ def write_LWCN_cycle_in_file(metrics_output_path
                 f.write(f"{'weight ratio of ILP cycle':<40}: {weight_ratio_cycle_ILP[Iteration-Num_paths-1]:.4f}\n")
                 #f.write(f"{'weight ratio of ILP cycle':<40}: {weight_ratio_cycle_ILP[Iteration-1]:.4f}\n")
 
-                f.write(f"{'length of ILP cycle excluding some segments':<40}: {length_cycle_ILP_excluding_some_segments:.2f}\n")
-                f.write(f"{'length weighted copy number of ILP cycle excluding some segments':<40}: {weight_cycle_ILP_excluding_some_segments:.2f}\n")
-                f.write(f"{'length weighted copy number of (original) graph excluding some segments':<40}: {weight_graph_excluding_some_segments:.2f}\n")
-                f.write(f"{'weight ratio of ILP cycle excluding some segments':<40}: {weight_ratio_cycle_ILP_excluding_some_segments[Iteration-Num_paths-1]:.4f}\n")
-                #f.write(f"{'weight ratio of ILP cycle excluding some segments':<40}: {weight_ratio_cycle_ILP_excluding_some_segments[Iteration-1]:.4f}\n")
 
                 f.write("\n")
         #f.write("\n")
@@ -2120,18 +2263,18 @@ def update_the_graph( concordant_edges, f_concordant_edge, X_concordant_edge, ca
     #     if edge_type in ('concordant edge', 'discordant edge', 'sequence edge'):
     #         walk_edges.add(tuple(sorted(edge)))
 
-    for (i,j) in concordant_edges:
+    for (i,j) in stable_iter(concordant_edges):
         edge = tuple(sorted((i, j)))
         if f_concordant_edge[edge] > 0 and X_concordant_edge[edge] > 0 : #and edge in walk_edges:
             capacity_concordant_edges[edge] -= f_concordant_edge[edge]
             
             
-    for (i,j) in discordant_edges:
+    for (i,j) in stable_iter(discordant_edges):
         edge = tuple(sorted((i, j)))
         if f_discordant_edge[edge] > 0 and X_discordant_edge[edge] > 0 : #and edge in walk_edges:
             capacity_discordant_edges[edge] -= f_discordant_edge[edge]
         
-    for (i,j) in sequence_edges:
+    for (i,j) in stable_iter(sequence_edges):
         edge = tuple(sorted((i, j)))
         if f_sequence_edge[edge] > 0 and X_sequence_edge[edge] > 0: # and edge in walk_edges:
             capacity_sequence_edges[edge] -= f_sequence_edge[edge]
@@ -2156,11 +2299,11 @@ def remove_s_t_from_graph(
     new_length_sequence_edges     = dict(length_sequence_edges)
 
     # 1. Collect all edges to 's' and 't'
-    s_edges = [(u, v) for u, v in G.edges() if 's' in (u, v)]
-    t_edges = [(u, v) for u, v in G.edges() if 't' in (u, v)]
+    s_edges = [(u, v) for u, v in stable_iter(G.edges()) if 's' in (u, v)]
+    t_edges = [(u, v) for u, v in stable_iter(G.edges()) if 't' in (u, v)]
 
     # 2. Remove these edges from G
-    for u, v in s_edges + t_edges:
+    for u, v in stable_iter(s_edges + t_edges):
         if G.has_edge(u, v):
             G.remove_edge(u, v)
 
@@ -2171,16 +2314,16 @@ def remove_s_t_from_graph(
         G.remove_node('t')
 
     # 4. Remove dictionary entries for edges connected to 's' or 't'
-    for d in [new_capacity_discordant_edges, new_capacity_sequence_edges,
-              new_K_discordant_edges, new_length_sequence_edges]:
-        for edge in list(d.keys()):
+    for d in stable_iter([new_capacity_discordant_edges, new_capacity_sequence_edges,
+              new_K_discordant_edges, new_length_sequence_edges]):
+        for edge in stable_iter(list(d.keys())):
             if 's' in edge or 't' in edge:
                 d.pop(edge, None)
 
     # 5. Recompute sets of edges after removal
-    discordant_edges = {tuple(sorted((u, v))) for u, v, attr in G.edges(data=True)
+    discordant_edges = {tuple(sorted((u, v))) for u, v, attr in stable_iter(G.edges(data=True))
                         if attr.get('type') == 'discordant'}
-    sequence_edges   = {tuple(sorted((u, v))) for u, v, attr in G.edges(data=True)
+    sequence_edges   = {tuple(sorted((u, v))) for u, v, attr in stable_iter(G.edges(data=True))
                         if attr.get('type') == 'sequence'}
 
     return G, G.nodes, discordant_edges, new_capacity_discordant_edges, sequence_edges, \
@@ -2191,14 +2334,14 @@ def creat_s_t_graph(G,capacity_discordant_edges,K_discordant_edges):
     G.add_node('t')
     # Make a copy so we don’t mutate caller dict
     new_capacity_discordant_edges = dict(capacity_discordant_edges)               
-    for node in G.nodes():
+    for node in stable_iter(G.nodes()):
         if node in {'s', 't'} or (isinstance(node, str) and node.isdigit()):
             continue
     
         
         dc_cns = [
             data.get('capacity', 0)
-            for _, _, data in get_incident_edges(G, node, edge_type_filter='discordant')
+            for _, _, data in stable_iter(get_incident_edges(G, node, edge_type_filter='discordant'))
         ]
         
         
@@ -2207,7 +2350,7 @@ def creat_s_t_graph(G,capacity_discordant_edges,K_discordant_edges):
         else:
             seq_cns = [
                 data.get('capacity', 0)
-                for _, _, data in get_incident_edges(G, node, edge_type_filter='sequence')
+                for _, _, data in stable_iter(get_incident_edges(G, node, edge_type_filter='sequence'))
             ]
             capacity = max(seq_cns) 
         
@@ -2221,7 +2364,7 @@ def creat_s_t_graph(G,capacity_discordant_edges,K_discordant_edges):
     
     discordant_edges = {
         tuple(sorted((u, v))) 
-        for u, v, attr in G.edges(data=True) 
+        for u, v, attr in stable_iter(G.edges(data=True)) 
         if attr.get('type') == 'discordant'}
     
     # capacity_discordant_edges = {
@@ -2233,7 +2376,7 @@ def creat_s_t_graph(G,capacity_discordant_edges,K_discordant_edges):
     
     K_discordant_edges = {
         tuple(sorted((u, v))): attr["K"]
-        for u, v, key, attr in G.edges(keys=True, data=True)
+        for u, v, key, attr in stable_iter(G.edges(keys=True, data=True))
         if attr.get("type") == "discordant" and "K" in attr}
     return G,G.nodes,discordant_edges,capacity_discordant_edges,K_discordant_edges
 ####### create s t graph like Coral. Connect s and t to the beginning and end of intervals only
@@ -2249,7 +2392,7 @@ def creat_s_t_graph_Coral(G, capacity_discordant_edges, K_discordant_edges, sequ
     # --- Detect intervals ---
     # Convert edges to list of (chrom, start, end) tuples
     seq_list = []
-    for u, v in sequence_edges:
+    for u, v in stable_iter(sequence_edges):
         chrom_u, start_u = u.split(":")
         chrom_v, end_v = v.split(":")
         start_u = int(start_u.rstrip("-+"))
@@ -2267,7 +2410,7 @@ def creat_s_t_graph_Coral(G, capacity_discordant_edges, K_discordant_edges, sequ
         prev_chrom = chrom
         prev_end = end
 
-        for chrom, start, end, u_node, v_node in seq_list[1:]:
+        for chrom, start, end, u_node, v_node in stable_iter(seq_list[1:]):
             if chrom == prev_chrom and start == prev_end + 1:
                 # extend current interval
                 interval_end_node = v_node
@@ -2283,18 +2426,18 @@ def creat_s_t_graph_Coral(G, capacity_discordant_edges, K_discordant_edges, sequ
         intervals.append((interval_start_node, interval_end_node))  # last interval
 
     # --- Add s/t edges for each interval ---
-    for start_node, end_node in intervals:
+    for start_node, end_node in stable_iter(intervals):
         # s -> start
         dc_cns = [
             data.get('capacity', 0)
-            for _, _, data in get_incident_edges(G, start_node, edge_type_filter='discordant')
+            for _, _, data in stable_iter(get_incident_edges(G, start_node, edge_type_filter='discordant'))
         ]
         if dc_cns:
             capacity = max(dc_cns)
         else:
             seq_cns = [
                 data.get('capacity', 0)
-                for _, _, data in get_incident_edges(G, start_node, edge_type_filter='sequence')
+                for _, _, data in stable_iter(get_incident_edges(G, start_node, edge_type_filter='sequence'))
             ]
             capacity = max(seq_cns) if seq_cns else 0
         G.add_edge('s', start_node, type='discordant', capacity=capacity, Read_Count=1000, K=1)
@@ -2305,14 +2448,14 @@ def creat_s_t_graph_Coral(G, capacity_discordant_edges, K_discordant_edges, sequ
         # end -> t
         dc_cns = [
             data.get('capacity', 0)
-            for _, _, data in get_incident_edges(G, end_node, edge_type_filter='discordant')
+            for _, _, data in stable_iter(get_incident_edges(G, end_node, edge_type_filter='discordant'))
         ]
         if dc_cns:
             capacity = max(dc_cns)
         else:
             seq_cns = [
                 data.get('capacity', 0)
-                for _, _, data in get_incident_edges(G, end_node, edge_type_filter='sequence')
+                for _, _, data in stable_iter(get_incident_edges(G, end_node, edge_type_filter='sequence'))
             ]
             capacity = max(seq_cns) if seq_cns else 0
         G.add_edge(end_node, 's', type='discordant', capacity=capacity, Read_Count=1000, K=1)
@@ -2323,13 +2466,13 @@ def creat_s_t_graph_Coral(G, capacity_discordant_edges, K_discordant_edges, sequ
     # --- Update sets ---
     discordant_edges = {
         tuple(sorted((u, v))) 
-        for u, v, attr in G.edges(data=True) 
+        for u, v, attr in stable_iter(G.edges(data=True)) 
         if attr.get('type') == 'discordant'
     }
     capacity_discordant_edges = new_capacity_discordant_edges
     K_discordant_edges = {
         tuple(sorted((u, v))): attr["K"]
-        for u, v, key, attr in G.edges(keys=True, data=True)
+        for u, v, key, attr in stable_iter(G.edges(keys=True, data=True))
         if attr.get("type") == "discordant" and "K" in attr
     }
 
@@ -2354,87 +2497,86 @@ def build_path_model(
                 path_constraints,
                 enforce_connectivity,
                 gamma,
-                model_class=Model,
-                solver_api=GRB):
-    if model_class is None or solver_api is None:
-        raise RuntimeError(
-            "The Gurobi backend is unavailable. Install gurobipy or run with --solver highs."
-        )
-    model = model_class("ILP_CoRAL_path")
+                f_lower_bound=None):
+    model = Model("ILP_CoRAL_path")
+    model.setParam("Seed", RANDOM_SEED)
+    model.setParam("Threads", 1)
     # Decision variables   
-    X_concordant_edge = model.addVars(concordant_edges, vtype=solver_api.BINARY, name="X_concordant_edge")
-    X_discordant_edge = model.addVars(discordant_edges, vtype=solver_api.BINARY, name="X_discordant_edge")
-    X_sequence_edge = model.addVars(sequence_edges, vtype=solver_api.BINARY, name="X_sequence_edge")   
-    f_concordant_edge = model.addVars(concordant_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_concordant_edge")
-    f_discordant_edge = model.addVars(discordant_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_discordant_edge")
-    f_sequence_edge = model.addVars(sequence_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_sequence_edge")    
-    F = model.addVar(name="f_min", lb=0, vtype=solver_api.CONTINUOUS)  
-    P = model.addVars(len(path_constraints), vtype=solver_api.BINARY, name="P_path_constraint")
+    X_concordant_edge = model.addVars(stable_iter(concordant_edges), vtype=GRB.BINARY, name="X_concordant_edge")
+    X_discordant_edge = model.addVars(stable_iter(discordant_edges), vtype=GRB.BINARY, name="X_discordant_edge")
+    X_sequence_edge = model.addVars(stable_iter(sequence_edges), vtype=GRB.BINARY, name="X_sequence_edge")   
+    f_concordant_edge = model.addVars(stable_iter(concordant_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_concordant_edge")
+    f_discordant_edge = model.addVars(stable_iter(discordant_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_discordant_edge")
+    f_sequence_edge = model.addVars(stable_iter(sequence_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_sequence_edge")    
+    F = model.addVar(name="f_min", lb=0, vtype=GRB.CONTINUOUS)  
+    if f_lower_bound is not None:
+        model.addConstr(F >= f_lower_bound, name="F_UserLowerBound")
+    P = model.addVars(stable_iter(len(path_constraints)), vtype=GRB.BINARY, name="P_path_constraint")
     y_discordant = {}
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
-        for m in range(1, K_discordant_edges[edge_key] + 1):
-            y_discordant[edge_key + (m,)] = model.addVar(name=f"y_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=solver_api.BINARY)
+        for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1)):
+            y_discordant[edge_key + (m,)] = model.addVar(name=f"y_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=GRB.BINARY)
     z_discordant = {}
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
-        for m in range(1, K_discordant_edges[edge_key] + 1):
-            z_discordant[edge_key + (m,)] = model.addVar(lb=0, name=f"z_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=solver_api.CONTINUOUS)
+        for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1)):
+            z_discordant[edge_key + (m,)] = model.addVar(lb=0, name=f"z_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=GRB.CONTINUOUS)
 
     
     ### Objective function
     if len(path_constraints)>0:
-        multiplier= gamma* sum(capacity_sequence_edges[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges)/ len(path_constraints)
+        multiplier= gamma* sum(capacity_sequence_edges[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in stable_iter(sequence_edges))/ len(path_constraints)
     else:
         multiplier=0
     
    ### Objective: Maximize total flow on sequence edges weighted by length and number of path constraints satisfied
     model.setObjective(
-        sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges)+ multiplier*sum(P[k] for k in range(len(path_constraints))),
-        solver_api.MAXIMIZE
+        sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in stable_iter(sequence_edges))+ multiplier*sum(P[k] for k in stable_iter(range(len(path_constraints)))),
+        GRB.MAXIMIZE
     )
     # Constraint 1: Copy number of an edge ≤ capacity × selection variable (for undirected edges)
     
-    for (i, j) in concordant_edges:
+    for (i, j) in stable_iter(concordant_edges):
         edge = tuple(sorted((i, j)))
         model.addConstr(
             f_concordant_edge[edge] <= capacity_concordant_edges[edge] * X_concordant_edge[edge],
             name=f"ConcordantEdgeCapacity_{edge[0]}_{edge[1]}")    
-    for (i, j) in discordant_edges: 
+    for (i, j) in stable_iter(discordant_edges): 
         edge = tuple(sorted((i, j)))
         model.addConstr(
             f_discordant_edge[edge] <= capacity_discordant_edges[edge] * X_discordant_edge[edge],
             name=f"DiscordantEdgeCapacity_{edge[0]}_{edge[1]}")    
-    for (i, j) in sequence_edges: 
+    for (i, j) in stable_iter(sequence_edges): 
         edge = tuple(sorted((i, j)))
         model.addConstr(
             f_sequence_edge[edge] <= capacity_sequence_edges[edge] * X_sequence_edge[edge],
             name=f"SequenceEdgeCapacity_{edge[0]}_{edge[1]}")
     ### Constraint 3: copy number sequence edge incident = copy number discordant/concordant edge incident 
     ##########################################################################    
-    for k in nodes:
+    for k in stable_iter(nodes):
         if k in {"s", "t"}:
             continue
     
         # Define undirected incident edges
         incident_edges = {
           tuple(sorted((i, k)))
-          for i in nodes
+          for i in stable_iter(nodes)
           if tuple(sorted((i, k))) in concordant_edges | discordant_edges | sequence_edges and i != k}
         # Flow into k (sequence edges)
         flow_in_sequence = sum(
             f_sequence_edge[edge]
-            for edge in incident_edges
+            for edge in stable_iter(incident_edges)
             if edge in sequence_edges and k in edge)
     
         # Flow out of k (concordant + discordant)
         flow_out_concordant = sum(
             f_concordant_edge[edge]
-            for edge in incident_edges
+            for edge in stable_iter(incident_edges)
             if edge in concordant_edges and k in edge)
         flow_out_discordant = sum(
             f_discordant_edge[edge]
-            for edge in incident_edges
+            for edge in stable_iter(incident_edges)
             if edge in discordant_edges and k in edge)
     
         model.addConstr(
@@ -2443,14 +2585,14 @@ def build_path_model(
     ### Constraint 4 "s" and "t" edges and the copy number of their incident edges
     flow_out_s_discordant = sum(
             f_discordant_edge[tuple(sorted(("s", k)))]
-            for k in nodes
+            for k in stable_iter(nodes)
             if tuple(sorted(("s", k))) in discordant_edges
         )
         
         ### Total flow into sink 't' on discordant edges
     flow_in_t_discordant = sum(
             f_discordant_edge[tuple(sorted((k, "t")))]
-            for k in nodes
+            for k in stable_iter(nodes)
             if tuple(sorted((k, "t"))) in discordant_edges
         )
         
@@ -2463,7 +2605,7 @@ def build_path_model(
     model.addConstr(
             sum(
                 X_discordant_edge[tuple(sorted(("s", k)))]
-                for k in nodes
+                for k in stable_iter(nodes)
                 if tuple(sorted(("s", k))) in discordant_edges
             ) == 1,
             name="OneEdgeOutOfS"
@@ -2472,54 +2614,54 @@ def build_path_model(
     model.addConstr(
             sum(
                 X_discordant_edge[tuple(sorted((k, "t")))]
-                for k in nodes
+                for k in stable_iter(nodes)
                 if tuple(sorted((k, "t"))) in discordant_edges
             ) == 1,
             name="OneEdgeIntoT"
         )
     ### Constraint 7 #Big-M constant (ensure it's large enough)    
     M = 1000000    
-    for edge in concordant_edges:
+    for edge in stable_iter(concordant_edges):
         i, j = edge
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             F <= f_concordant_edge[edge_key] + M * (1 - X_concordant_edge[edge_key]),
             name=f"ConcordantEdgeCapacity_{i}_{j}")    
-    for edge in discordant_edges:
+    for edge in stable_iter(discordant_edges):
         i, j = edge
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             F <= f_discordant_edge[edge_key] + M * (1 - X_discordant_edge[edge_key]),
             name=f"DiscordantEdgeCapacity_{i}_{j}")
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
-            sum(y_discordant[edge_key + (m,)] for m in range(1, K_discordant_edges[edge_key] + 1)) == X_discordant_edge[edge_key],
+            sum(y_discordant[edge_key + (m,)] for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1))) == X_discordant_edge[edge_key],
             name=f"one_multiple_discordant_{edge_key[0]}_{edge_key[1]}")
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
-        for m in range(1, K_discordant_edges[edge_key] + 1):
+        for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1)):
             z = z_discordant[edge_key + (m,)]
             y = y_discordant[edge_key + (m,)]
             model.addConstr(z <= F, name=f"z_leq_fmin_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z <= M * y, name=f"z_leq_My_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z >= F - M * (1 - y), name=f"z_geq_fmin_minus_M_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z >= 0, name=f"z_geq_0_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
-    for i, j in discordant_edges:
+    for i, j in stable_iter(discordant_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
-            f_discordant_edge[edge_key] == sum(m * z_discordant[edge_key + (m,)] for m in range(1, K_discordant_edges[edge_key] + 1)),
+            f_discordant_edge[edge_key] == sum(m * z_discordant[edge_key + (m,)] for m in stable_iter(range(1, K_discordant_edges[edge_key] + 1))),
             name=f"flow_def_discordant_{edge_key[0]}_{edge_key[1]}")
     #### Constarints 9 Path constraints
-    for (i, j, k) in p_sequence_edges:
+    for (i, j, k) in stable_iter(p_sequence_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             X_sequence_edge[edge_key] >= P[k] * p_sequence_edges[(i, j, k)])
-    for (i, j, k) in p_concordant_edges:
+    for (i, j, k) in stable_iter(p_concordant_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             X_concordant_edge[edge_key] >= P[k] * p_concordant_edges[(i, j, k)])
-    for (i, j, k) in p_discordant_edges:
+    for (i, j, k) in stable_iter(p_discordant_edges):
         edge_key = tuple(sorted((i, j)))
         model.addConstr(
             X_discordant_edge[edge_key] >= P[k] * p_discordant_edges[(i, j, k)])
@@ -2530,13 +2672,13 @@ def build_path_model(
         #####################################################
         all_edges = concordant_edges | discordant_edges | sequence_edges
         # Generate all directed versions of directed variables on undirected edges
-        directed_sequence_edges = {(u, v) for u, v in sequence_edges} | {(v, u) for u, v in sequence_edges}
-        directed_concordant_edges = {(u, v) for u, v in concordant_edges} | {(v, u) for u, v in concordant_edges}
-        directed_discordant_edges = {(u, v) for u, v in discordant_edges} | {(v, u) for u, v in discordant_edges}
-        c_seq  = model.addVars(directed_sequence_edges,   vtype=solver_api.BINARY, name="c_seq")
-        c_conc = model.addVars(directed_concordant_edges, vtype=solver_api.BINARY, name="c_conc")
-        c_disc = model.addVars(directed_discordant_edges, vtype=solver_api.BINARY, name="c_disc")
-        d = model.addVars(G.nodes, vtype=solver_api.INTEGER, lb=0, ub=len(G.nodes), name="d")
+        directed_sequence_edges = {(u, v) for u, v in stable_iter(sequence_edges)} | {(v, u) for u, v in stable_iter(sequence_edges)}
+        directed_concordant_edges = {(u, v) for u, v in stable_iter(concordant_edges)} | {(v, u) for u, v in stable_iter(concordant_edges)}
+        directed_discordant_edges = {(u, v) for u, v in stable_iter(discordant_edges)} | {(v, u) for u, v in stable_iter(discordant_edges)}
+        c_seq  = model.addVars(stable_iter(directed_sequence_edges),   vtype=GRB.BINARY, name="c_seq")
+        c_conc = model.addVars(stable_iter(directed_concordant_edges), vtype=GRB.BINARY, name="c_conc")
+        c_disc = model.addVars(stable_iter(directed_discordant_edges), vtype=GRB.BINARY, name="c_disc")
+        d = model.addVars(stable_iter(G.nodes), vtype=GRB.INTEGER, lb=0, ub=len(G.nodes), name="d")
         
     
         
@@ -2547,7 +2689,7 @@ def build_path_model(
         ##### y_minu('s', every other node)=0, y_plus(every other node,'s')=0
         ###################################################### 
        
-        for u, v in directed_discordant_edges:
+        for u, v in stable_iter(directed_discordant_edges):
             if u != 's':
                 continue
             edge = tuple(sorted((u, v)))  # Get the undirected version
@@ -2575,9 +2717,9 @@ def build_path_model(
         ######################################################
         num_nodes = len(G.nodes)
     
-        for u in G.nodes:
+        for u in stable_iter(G.nodes):
             incident_x_vars = []
-            for v in G.neighbors(u):
+            for v in stable_iter(G.neighbors(u)):
                 edge = tuple(sorted((u, v)))
                 if edge in sequence_edges:
                     incident_x_vars.append(X_sequence_edge[edge])
@@ -2594,15 +2736,15 @@ def build_path_model(
         ###### Connectivity constraint 2 ##################
         ###################################################
                             
-        for u, v in sequence_edges:
+        for u, v in stable_iter(sequence_edges):
             edge = tuple(sorted((u, v)))
             model.addConstr(c_seq[u, v] + c_seq[v, u] <= X_sequence_edge[(u, v)], name=f"dir_seq_use_{u}_{v}")
         
-        for u, v in concordant_edges:
+        for u, v in stable_iter(concordant_edges):
             edge = tuple(sorted((u, v)))
             model.addConstr(c_conc[u, v] + c_conc[v, u] <= X_concordant_edge[(u, v)], name=f"dir_conc_use_{u}_{v}")
         
-        for u, v in discordant_edges:
+        for u, v in stable_iter(discordant_edges):
             edge = tuple(sorted((u, v)))
             model.addConstr(c_disc[u, v] + c_disc[v, u] <= X_discordant_edge[(u, v)], name=f"dir_disc_use_{u}_{v}")
         
@@ -2610,12 +2752,12 @@ def build_path_model(
         ######### Connectivity constraint 3 ###############
         ###################################################
         all_nodes = list(G.nodes)
-        for u in all_nodes:
+        for u in stable_iter(all_nodes):
             if u == 's':
                 continue  # skip source
             incoming_c = []
     
-            for v in all_nodes:
+            for v in stable_iter(all_nodes):
                 if (v, u) in c_seq:
                     incoming_c.append(c_seq[v, u])
                 if (v, u) in c_conc:
@@ -2627,7 +2769,7 @@ def build_path_model(
         
             # Compute total x variables that involve u (undirected edge participation)
             x_incident = []
-            for v in G.neighbors(u):
+            for v in stable_iter(G.neighbors(u)):
                 edge = tuple(sorted((u, v)))  # undirected
                 if edge in X_sequence_edge:
                     x_incident.append(X_sequence_edge[edge])
@@ -2648,19 +2790,19 @@ def build_path_model(
         ######### Connectivity constraint 4 ###############
         ###################################################
                         
-        for u, v in directed_sequence_edges:
+        for u, v in stable_iter(directed_sequence_edges):
             if (u, v) in c_seq:
                 model.addConstr(
                     d[v] - d[u] + num_nodes * (1 - c_seq[u, v]) >= 1,
                     name=f"d_order_sequence_{u}_{v}"
                 )
-        for u, v in directed_concordant_edges:
+        for u, v in stable_iter(directed_concordant_edges):
             if (u, v) in c_conc:
                 model.addConstr(
                     d[v] - d[u] + num_nodes * (1 - c_conc[u, v]) >= 1,
                     name=f"d_order_concordant_{u}_{v}"
                 )
-        for u, v in directed_discordant_edges:
+        for u, v in stable_iter(directed_discordant_edges):
             if (u, v) in c_disc:
                 model.addConstr(
                     d[v] - d[u] + num_nodes * (1 - c_disc[u, v]) >= 1,
@@ -2681,13 +2823,6 @@ def build_path_model(
         "y_discordant": y_discordant,
         "z_discordant": z_discordant,
     }
-def build_path_model_highs(*args, **kwargs):
-    """Build the path MILP with the HiGHS backend."""
-    kwargs["model_class"] = HighsModel
-    kwargs["solver_api"] = HighsGRB
-    return build_path_model(*args, **kwargs)
-
-
 ########## Heuristic to create paths
 def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discordant_edge, 
                      concordant_edges, f_concordant_edge,max_attempts,segments, F):
@@ -2705,7 +2840,7 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
         )
     # Filter and normalize undirected sequence edges
     solution_sequence_edges = []
-    for (i, j) in sequence_edges:
+    for (i, j) in sorted(sequence_edges):
         # if i == "t" or j == "t":
         #     continue
         if f_sequence_edge[i, j] > 0:
@@ -2713,7 +2848,7 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
             solution_sequence_edges.extend([tuple(sorted((i, j)))] * multiplicity)
     
     solution_discordant_edges = []
-    for (i, j) in discordant_edges:
+    for (i, j) in sorted(discordant_edges):
         # if i == "s" or j == "s":
         #     continue
         if f_discordant_edge[i, j] > 0:
@@ -2721,7 +2856,7 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
             solution_discordant_edges.extend([tuple(sorted((i, j)))] * multiplicity)
     
     solution_concordant_edges = []
-    for (i, j) in concordant_edges:
+    for (i, j) in sorted(concordant_edges):
         if f_concordant_edge[i, j] > 0:
             multiplicity = round(f_concordant_edge[i, j] / F)
             solution_concordant_edges.extend([tuple(sorted((i, j)))] * multiplicity)
@@ -2740,7 +2875,7 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
     ]
     if not start_candidates:
         return [[]], 1
-    start_edge = random.choice(start_candidates)
+    start_edge = random.choice(sorted(start_candidates))
     use_edge(remaining_discordant_edges, start_edge)
     first_walk_edges.append(("node", current_node))
     first_walk_edges.append(("discordant edge", start_edge))
@@ -2755,7 +2890,7 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
                 e for e in remaining_sequence_edges.elements()
                 if current_node in e
             ]
-            match = random.choice(candidates) if candidates else None
+            match = random.choice(sorted(candidates)) if candidates else None
             if not match:
                 break
             use_edge(remaining_sequence_edges, match)
@@ -2775,7 +2910,7 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
                 for e in remaining_concordant_edges.elements()
                 if current_node in e
             ]
-            selected = random.choice(candidates) if candidates else None
+            selected = random.choice(sorted(candidates)) if candidates else None
             match = selected[1] if selected else None
             if not match:
                 break
@@ -2811,79 +2946,11 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
         
     return s_t_Walk, error_in_closed_walks
 
-
-def select_best_s_t_walk(
-        sequence_edges, f_sequence_edge,
-        discordant_edges, f_discordant_edge,
-        concordant_edges, f_concordant_edge,
-        segments, path_constraints, F, candidate_runs=100):
-    """Generate s-t candidates and retain the best validated path-constraint match."""
-    best_candidate = None
-    best_rank = None
-
-    for _ in range(candidate_runs):
-        s_t_walks, construction_error = create_s_t_walks(
-            sequence_edges, f_sequence_edge,
-            discordant_edges, f_discordant_edge,
-            concordant_edges, f_concordant_edge,
-            1, segments, F,
-        )
-        primary_walk = s_t_walks[0] if s_t_walks else []
-        merged_walk, not_merged_walks = merge_all_closed_walks(s_t_walks)
-        walk_is_complete = test_merged_closed_walk(
-            primary_walk,
-            sequence_edges, f_sequence_edge,
-            discordant_edges, f_discordant_edge,
-            concordant_edges, f_concordant_edge,
-            F, Path=True,
-        )
-        has_s_t_endpoints = (
-            bool(primary_walk)
-            and primary_walk[0] == ("node", "s")
-            and primary_walk[-1] == ("node", "t")
-            and is_edge_type_alternating(primary_walk)
-        )
-
-        segment_string = convert_s_t_walk_to_segment_string(
-            primary_walk[2:-2], segments, copy_count=F
-        )
-        segment_list = segment_string.split("Segments=", 1)[1].split(",")
-        if segment_list == [""]:
-            segment_list = []
-        matched_constraints = set(match_e_constraints(segment_list, path_constraints))
-
-        candidate_is_valid = (
-            construction_error == 0 and has_s_t_endpoints and walk_is_complete
-        )
-        rank = (
-            int(candidate_is_valid),
-            len(matched_constraints),
-            int(walk_is_complete),
-            int(has_s_t_endpoints),
-            -len(not_merged_walks),
-        )
-        if best_rank is None or rank > best_rank:
-            best_rank = rank
-            best_candidate = {
-                "walks": s_t_walks,
-                "walk": primary_walk,
-                "merged_walk": merged_walk,
-                "not_merged_walks": not_merged_walks,
-                "construction_error": construction_error,
-                "endpoint_test": has_s_t_endpoints,
-                "completion_test": walk_is_complete,
-                "segment_string": segment_string,
-                "segments": segment_list,
-                "matched_constraints": matched_constraints,
-            }
-
-    return best_candidate
-
 ############# convert s-t walk to segment string
 def convert_s_t_walk_to_segment_string(walk, segments, copy_count):
     segment_path = []
 
-    for i in range(len(walk)):
+    for i in stable_iter(range(len(walk))):
         entry = walk[i]
         if entry[0] != "sequence edge":
             continue
@@ -2905,7 +2972,7 @@ def convert_s_t_walk_to_segment_string(walk, segments, copy_count):
             continue
 
         #for seg_id, (seg_chrom, seg_start, seg_end) in segments.items():
-        for seg_id, seg_info in segments.items():
+        for seg_id, seg_info in stable_iter(segments.items()):
             seg_chrom = seg_info["chrom"]
             seg_start = seg_info["start"]
             seg_end   = seg_info["end"]
@@ -2953,7 +3020,7 @@ def write_paths_in_ILP_cycle_file(
 
         with open(new_output_file, "a") as out_f:
             out_f.write(path_string)
-            path_str = ",".join(str(i) for i in sorted(matched_index_set))
+            path_str = ",".join(str(i) for i in stable_iter(sorted(matched_index_set)))
             out_f.write(f";Path_constraints_satisfied={path_str}\n")
 
         return   # done for this case
@@ -2965,7 +3032,7 @@ def write_paths_in_ILP_cycle_file(
 
         # ------- Print segments -------
         out_f.write("List of cycle segments\n")
-        for seg_id in sorted(segments.keys()):
+        for seg_id in stable_iter(sorted(segments.keys())):
             seg = segments[seg_id]
             out_f.write(
                 f"Segment\t{seg['id']}\t{seg['chrom']}\t{seg['start']}\t{seg['end']}\n"
@@ -2974,7 +3041,7 @@ def write_paths_in_ILP_cycle_file(
         # ------- Print path constraints -------
         out_f.write("List of longest subpath constraints\n")
 
-        for pc in Path_Constraints:
+        for pc in stable_iter(Path_Constraints):
             status = "Satisfied" if pc["index"] in matched_index_set else "Unsatisfied"
             out_f.write(
                 f"Path constraint\t{pc['index']}\t{pc['constraint_string']}"
@@ -2986,13 +3053,12 @@ def write_paths_in_ILP_cycle_file(
 
         # ------- Write first path -------
         out_f.write(path_string)
-        path_str = ",".join(str(i) for i in sorted(matched_index_set))
+        path_str = ",".join(str(i) for i in stable_iter(sorted(matched_index_set)))
         out_f.write(f";Path_constraints_satisfied={path_str}\n")
 
 ############# write the LWCN of paths in LWCN output file
 def write_LWCN_path_in_file(metrics_output_path
                              ,weight_path_ILP,weight_graph,weight_ratio_path_ILP, length_path_ILP
-                             ,weight_path_ILP_excluding_some_segments,weight_graph_excluding_some_segments,weight_ratio_path_ILP_excluding_some_segments, length_path_ILP_excluding_some_segments
                              ,F,Iteration,Num_cycles):
     with open(metrics_output_path, "a") as f:
         # Only write Coral cycle info for the first iteration
@@ -3020,10 +3086,6 @@ def write_LWCN_path_in_file(metrics_output_path
                 f.write(f"{'length weighted copy number of ILP path':<40}: {weight_path_ILP:.2f}\n")
                 f.write(f"{'length weighted copy number of (original) graph':<40}: {weight_graph:.2f}\n")
                 f.write(f"{'weight ratio of ILP path':<40}: {weight_ratio_path_ILP[Iteration-Num_cycles-1]:.4f}\n")
-                f.write(f"{'length of ILP path excluding some segments':<40}: {length_path_ILP_excluding_some_segments:.2f}\n")
-                f.write(f"{'length weighted copy number of ILP path excluding some segments':<40}: {weight_path_ILP_excluding_some_segments:.2f}\n")
-                f.write(f"{'length weighted copy number of (original) graph excluding some segments':<40}: {weight_graph_excluding_some_segments:.2f}\n")
-                f.write(f"{'weight ratio of ILP path excluding some segments':<40}: {weight_ratio_path_ILP_excluding_some_segments[Iteration-Num_cycles-1]:.4f}\n")
                 f.write("\n")
         else:
             with open(metrics_output_path, "a") as f:
@@ -3034,13 +3096,8 @@ def write_LWCN_path_in_file(metrics_output_path
                 f.write(f"{'length weighted copy number of ILP path':<40}: {weight_path_ILP:.2f}\n")
                 f.write(f"{'length weighted copy number of (original) graph':<40}: {weight_graph:.2f}\n")
                 f.write(f"{'weight ratio of ILP path':<40}: {weight_ratio_path_ILP[Iteration-Num_cycles-1]:.4f}\n")
-                f.write(f"{'length of ILP path excluding some segments':<40}: {length_path_ILP_excluding_some_segments:.2f}\n")
-                f.write(f"{'length weighted copy number of ILP path excluding some segments':<40}: {weight_path_ILP_excluding_some_segments:.2f}\n")
-                f.write(f"{'length weighted copy number of (original) graph excluding some segments':<40}: {weight_graph_excluding_some_segments:.2f}\n")
-                f.write(f"{'weight ratio of ILP path excluding some segments':<40}: {weight_ratio_path_ILP_excluding_some_segments[Iteration-Num_cycles-1]:.4f}\n")
                 f.write("\n")
 
-######## Print the cycles and paths in order of LWCN excluding some segments
 def write_all_cycles_and_paths(segments, new_output_file, all_cycles_ordered, all_paths_ordered, path_constraints):
     """
     Writes all cycles and all paths at once, in the order provided.
@@ -3057,7 +3114,7 @@ def write_all_cycles_and_paths(segments, new_output_file, all_cycles_ordered, al
        # if first_write:
             # List of cycle segments
         out_f.write("List of cycle segments\n")
-        for seg_id in sorted(segments.keys()):
+        for seg_id in stable_iter(sorted(segments.keys())):
             seg = segments[seg_id]
             out_f.write(
                 f"Segment\t{seg['id']}\t{seg['chrom']}\t{seg['start']}\t{seg['end']}\n"
@@ -3066,7 +3123,7 @@ def write_all_cycles_and_paths(segments, new_output_file, all_cycles_ordered, al
         # List of path constraints
         out_f.write("List of longest subpath constraints\n")
         if path_constraints:
-            for pc in path_constraints:
+            for pc in stable_iter(path_constraints):
                 # For now, no cycle-specific match info; just list constraints
                 out_f.write(
                     f"Path constraint\t{pc['index']}\t{pc['constraint_string']}"
@@ -3077,27 +3134,27 @@ def write_all_cycles_and_paths(segments, new_output_file, all_cycles_ordered, al
         out_f.write("List of extracted cycles/paths\n")
 
         # --- Write all cycles ---
-        for cycle in all_cycles_ordered:
+        for cycle in stable_iter(all_cycles_ordered):
             seg_str = ",".join(cycle["Segments"])
             matched_index_set = cycle.get("Matched_Index_Set", set())
-            path_str = ",".join(str(i) for i in sorted(matched_index_set))
+            path_str = ",".join(str(i) for i in stable_iter(sorted(matched_index_set)))
 
             out_f.write(
                 f"Cycle={cycle['New_Order_Of_Cycle_Number']};"
-                f"Copy_count={cycle['CopyNumber']};"
+                f"Copy_count={cycle['CopyNumber']:.8f};"
                 f"Segments={seg_str};"
                 f"Path_constraints_satisfied={path_str}\n"
             )
 
         # --- Write all paths ---
-        for path in all_paths_ordered:
+        for path in stable_iter(all_paths_ordered):
             seg_str = ",".join(path["Segments"])
             matched_index_set = path.get("Matched_Index_Set", set())
-            path_str = ",".join(str(i) for i in sorted(matched_index_set))
+            path_str = ",".join(str(i) for i in stable_iter(sorted(matched_index_set)))
 
             out_f.write(
                 f"Path={path['New_Order_Of_Path_Number']};"
-                f"Copy_count={path['CopyNumber']};"
+                f"Copy_count={path['CopyNumber']:.8f};"
                 f"Segments={seg_str};"
                 f"Path_constraints_satisfied={path_str}\n"
             )
@@ -3155,7 +3212,7 @@ def export_cycles_to_fasta(cycles_file, reference_file, fasta_output, converter_
 ################## The code starts here #############################
 #####################################################################
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 #ENFORCE_CONNECTIVITY = False #True False
 TIME_LIMIT_SECONDS = 2*60*60 #2 * 60 * 60  # 2 hours
@@ -3167,21 +3224,54 @@ delta_F=0
 # -----------------------------------------
 # Parse command-line arguments
 # -----------------------------------------
+def positive_int(value):
+    """Argparse type for integer command-line values that must be positive."""
+    try:
+        parsed_value = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed_value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed_value
+
+
 parser = argparse.ArgumentParser(description="Run Cycle Extractor ILP Solver.")
 parser.add_argument("--graph", required=True, help="Path to input graph file.")
 parser.add_argument("--output", required=True, help="Path to output cycles file.")
 parser.add_argument("--log_file", help="Optional, path to log file.")
+parser.add_argument("--solver", choices=["gurobi", "highs"], default="gurobi",
+                    help="Optimization backend (default: gurobi).")
+parser.add_argument("--seed", type=int, choices=range(0, 2000000001), default=0,
+                    metavar="N", help="Python/NumPy/Gurobi random seed, 0..2000000000 (default: 0).")
+parser.add_argument(
+    "--time-limit-seconds",
+    type=positive_int,
+    default=TIME_LIMIT_SECONDS,
+    help="Time limit for each cycle/path optimization in seconds (default: 7200 = 2 hours).",
+)
 parser.add_argument("--enforce-connectivity",action="store_true",help="Enable connectivity-enforced ILP (default = off)")
 parser.add_argument("--gamma",type=float,default=0.01,help="Gamma value (default = 0.01)")
+parser.add_argument(
+    "--max-multiplicity",
+    type=positive_int,
+    default=5,
+    help=(
+        "Maximum multiplicity considered when inferring discordant-edge "
+        "multiplicity bounds (default = 5)."
+    ),
+)
+parser.add_argument(
+    "--f-lower-bound",
+    type=float,
+    default=None,
+    help=(
+        "Optional lower bound for the model variable F. When omitted, no "
+        "user-defined lower-bound constraint is added."
+    ),
+)
 parser.add_argument("--version",action="version",version=f"CE version {__version__}",help="Print version and exit")
 parser.add_argument("--sort-by",choices=["CopyNumber", "LWCN"],default="CopyNumber",help="How to sort cycles/paths: CopyNumber (default) or LWCN")
 parser.add_argument("--s-t-strategy",choices=["all_nodes", "intervals"],default="all_nodes",help="s/t connection strategy: 'all_nodes' (default) or 'intervals' (only interval start/end)")
-parser.add_argument(
-    "--solver",
-    choices=["gurobi", "highs"],
-    default="gurobi",
-    help="MILP solver backend (default: gurobi).",
-)
 parser.add_argument(
     "--fasta-output",
     help=(
@@ -3202,22 +3292,24 @@ parser.add_argument(
     ),
 )
 args = parser.parse_args()
+if args.solver == "gurobi":
+    if GurobiModel is None:
+        parser.error("Gurobi requires gurobipy. Install it or select --solver highs.")
+    Model, GRB = GurobiModel, GurobiGRB
+else:
+    if highspy is None:
+        parser.error("HiGHS requires highspy. Install it with: pip install highspy")
+    Model, GRB = HighsModel, HighsGRB
+print(f"MILP solver: {args.solver}")
+RANDOM_SEED = args.seed
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+print(f"Random seed: {RANDOM_SEED}; Solver threads: 1")
+TIME_LIMIT_SECONDS = args.time_limit_seconds
+print(f"Time limit per optimization: {TIME_LIMIT_SECONDS} seconds")
 
 if bool(args.fasta_output) != bool(args.ref):
     parser.error("--fasta-output and --ref must be provided together.")
-if args.solver == "gurobi" and (Model is None or GRB is None):
-    parser.error(
-        "The Gurobi backend is unavailable because gurobipy is not installed. "
-        "Install gurobipy or use --solver highs."
-    )
-if args.solver == "highs" and highspy is None:
-    parser.error(
-        "The HiGHS backend is unavailable because highspy is not installed. "
-        "Install it with: pip install highspy"
-    )
-
-cycle_model_builder = build_cycle_model if args.solver == "gurobi" else build_cycle_model_highs
-path_model_builder = build_path_model if args.solver == "gurobi" else build_path_model_highs
 
 # -----------------------------------------
 # Resolve paths
@@ -3236,8 +3328,14 @@ print(f"Test/output directory: {output_dir}")
 #gamma=0.01
 gamma = args.gamma
 print(f"Gamma value set to: {gamma}")
+max_multiplicity = args.max_multiplicity
+print(f"Maximum discordant-edge multiplicity set to: {max_multiplicity}")
+f_lower_bound = args.f_lower_bound
+if f_lower_bound is None:
+    print("Optional F lower-bound constraint is disabled.")
+else:
+    print(f"Optional F lower-bound constraint enabled: F >= {f_lower_bound}")
 print(f"CE version: {__version__}")
-print(f"MILP solver: {args.solver}")
 # if args.version:
 #     print(f"CE version {__version__}")
 #     sys.exit(0)
@@ -3273,7 +3371,7 @@ class Logger:
         while "\n" in self.buffer:
             line, self.buffer = self.buffer.split("\n", 1)
             if line.strip():
-                timestamp = datetime.now().strftime("[%H:%M:%S.%f] ")
+                timestamp = datetime.now().strftime("[%H:%M:%S.%f ]  ")[:-3]
                 self.log.write(f"{timestamp}{line}\n")
                 self.terminal.write(f"{line}\n")
             else:
@@ -3294,22 +3392,11 @@ sys.stdout = Logger(log_file)
 #ilp_test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
 #test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
 print(f"CE version: {__version__}")
+if args.solver == "highs":
+    print(f"HiGHS version: {highspy.Highs().version()}")
 print(f"Gamma value set to: {gamma}")
-print(f"MILP solver: {args.solver}")
-print(f"Cycle sorting method: {args.sort_by}")
-print(f"Source/sink connection strategy: {args.s_t_strategy}")
 print(f"Using graph file: {graph_file_path}")
 print(f"Test/output directory: {output_file}")
-if args.fasta_output:
-    print("FASTA export: enabled")
-    print(f"FASTA output file: {Path(args.fasta_output).expanduser().resolve()}")
-    print(f"Reference genome: {Path(args.ref).expanduser().resolve()}")
-    print(
-        "Cycles-to-FASTA script: "
-        f"{Path(args.cycles_to_fasta_script).expanduser().resolve()}"
-    )
-else:
-    print("FASTA export: disabled")
 
 #gamma=0.01
 gamma = args.gamma
@@ -3339,18 +3426,15 @@ print("Creating the graph:")
     p_concordant_edges,
     p_discordant_edges,
     path_constraints
-) = Create_graph(graph_file_path) 
+) = Create_graph(graph_file_path, max_multiplicity=max_multiplicity)
 if ENFORCE_CONNECTIVITY:
     G, nodes, discordant_edges, capacity_discordant_edges, sequence_edges, capacity_sequence_edges, K_discordant_edges, length_sequence_edges= creat_s_t_graph_for_connected_cycles(G,capacity_discordant_edges,capacity_sequence_edges,K_discordant_edges,length_sequence_edges)
 capacity_sequence_edges_original=capacity_sequence_edges.copy()
 total_solution_weight=0
 weight_graph=compute_Length_weighted_copy_number_graph(capacity_sequence_edges,length_sequence_edges)
-weight_graph_excluding_some_segments=compute_LWCN_graph_excluding_some_edges(capacity_sequence_edges_original,length_sequence_edges)
 p_ij = {}        
 weight_ratio_ILP_cycle=[]
-weight_ratio_ILP_cycle_excluding_some_segments=[]
 weight_ratio_ILP_path=[]
-weight_ratio_ILP_path_excluding_some_segments=[]
 Iteration=1
 Cycle_Or_Path_Number=1
 Num_paths=0
@@ -3365,7 +3449,7 @@ while True: #while Iteration==1:
     ###################################################
     
     ####### Cycle solution
-    ILP_Cycle_model, variables = cycle_model_builder(
+    ILP_Cycle_model, variables= build_cycle_model(
                     G,
                     nodes,
                     concordant_edges,
@@ -3382,14 +3466,24 @@ while True: #while Iteration==1:
                     p_discordant_edges,
                     path_constraints,
                     ENFORCE_CONNECTIVITY,
-                    gamma)
+                    gamma,
+                    f_lower_bound)
     
     ILP_Cycle_model.setParam('TimeLimit', TIME_LIMIT_SECONDS)
     print(f"Start extracting cycle {Cycle_Or_Path_Number}")
     start_time = time.time()
     ILP_Cycle_model.optimize()
     end_time = time.time()
-    
+
+    # Never read .X unless an accepted solution exists.
+    if not optimization_model_has_usable_solution(ILP_Cycle_model):
+        print(f"Stopping cycle extraction: status={ILP_Cycle_model.Status}, solutions={ILP_Cycle_model.SolCount}")
+        Num_cycles = Cycle_Or_Path_Number - 1
+        break
+    stop_after_cycle = not optimization_model_is_optimal(ILP_Cycle_model)
+    if stop_after_cycle:
+        print("Cycle time limit reached: saving the feasible incumbent before stopping cycle extraction.")
+
     X_concordant_edge = variables["X_concordant_edge"]
     X_discordant_edge= variables["X_discordant_edge"]
     X_sequence_edge = variables["X_sequence_edge"]
@@ -3401,18 +3495,28 @@ while True: #while Iteration==1:
     y_discordant = variables["y_discordant"]
     z_discordant = variables["z_discordant"]
     
-    X_concordant_edge_val  = {k: float(v.X) for k, v in X_concordant_edge.items()}
-    X_discordant_edge_val  = {k: float(v.X) for k, v in X_discordant_edge.items()}
-    X_sequence_edge_val    = {k: float(v.X) for k, v in X_sequence_edge.items()}
-    f_concordant_edge_val  = {k: float(v.X) for k, v in f_concordant_edge.items()}
-    f_discordant_edge_val  = {k: float(v.X) for k, v in f_discordant_edge.items()}
-    f_sequence_edge_val    = {k: float(v.X) for k, v in f_sequence_edge.items()}
+    X_concordant_edge_val  = {k: float(v.X) for k, v in stable_iter(X_concordant_edge.items())}
+    X_discordant_edge_val  = {k: float(v.X) for k, v in stable_iter(X_discordant_edge.items())}
+    X_sequence_edge_val    = {k: float(v.X) for k, v in stable_iter(X_sequence_edge.items())}
+    f_concordant_edge_val  = {k: float(v.X) for k, v in stable_iter(f_concordant_edge.items())}
+    f_discordant_edge_val  = {k: float(v.X) for k, v in stable_iter(f_discordant_edge.items())}
+    f_sequence_edge_val    = {k: float(v.X) for k, v in stable_iter(f_sequence_edge.items())}
     F_val = float(F.X)
-    P_val = {k: float(v.X) for k, v in P.items()}
+    base_F = F_val
+    P_val = {k: float(v.X) for k, v in stable_iter(P.items())}
+    print_iteration_solution(
+        Iteration, "Cycle", ILP_Cycle_model, F_val,
+        f_sequence_edge_val, X_sequence_edge_val, length_sequence_edges,
+        f_concordant_edge_val, X_concordant_edge_val,
+        f_discordant_edge_val, X_discordant_edge_val)
+
     
-    if not optimization_model_is_optimal(ILP_Cycle_model) or total_solution_weight > 0.9*weight_graph or F_val<1:
-        
-        Num_cycles=Cycle_Or_Path_Number-1
+    if (
+        total_solution_weight > 0.9 * weight_graph
+        or F_val < 0.5
+    ):
+        log_stopping_cutoffs("Cycle", Iteration, F_val, total_solution_weight, weight_graph)
+        Num_cycles = Cycle_Or_Path_Number - 1
         break
     max_random_search_heuristic_attempts = 100
     # if ENFORCE_CONNECTIVITY:
@@ -3429,12 +3533,9 @@ while True: #while Iteration==1:
         discordant_edges, f_discordant_edge_val,
         concordant_edges, f_concordant_edge_val,
         segments, Path_Constraints, F_val,
-        candidate_runs=max_random_search_heuristic_attempts,
-    )
-    print(
-        f"Selected the best of {max_random_search_heuristic_attempts} cycle-walk candidates; "
-        f"matched {len(best_cycle_candidate['matched_constraints'])} path constraints."
-    )
+        candidate_runs=max_random_search_heuristic_attempts)
+    print(f"Selected the best of {max_random_search_heuristic_attempts} cycle-walk candidates; "
+          f"matched {len(best_cycle_candidate['matched_constraints'])} path constraints.")
     all_closed_walks = best_cycle_candidate["all_walks"]
     Final_closed_walk = best_cycle_candidate["walk"]
     not_merged_walks = best_cycle_candidate["not_merged_walks"]
@@ -3442,48 +3543,25 @@ while True: #while Iteration==1:
     Final_closed_walk_test = best_cycle_candidate["walk_test"]
     test_message = best_cycle_candidate["test_message"]
     Final_closed_walk_completion_test = best_cycle_candidate["completion_test"]
-    delta_F=0
+    # Each component starts from this iteration's original solver CN.
+    F_val = base_F
+    delta_F = 0.0
+    start_time_to_update = time.time()
     if not Final_closed_walk_completion_test:
-        delta_F=Increase_CN(Final_closed_walk, F_val, capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges)
-        #print("F =", F)
-        #print("Cycle 1 = ", Final_closed_walk)
-        #print("delta_F1 = " ,delta_F)
-        #print("f_seq_edge before =" , f_sequence_edge_val)
-        if delta_F>0:
-            start_time_to_update = time.time()
-            #print("f_sequence_before =" , f_sequence_edge_val)
-            walk_edges = {
-                edge for edge_type, edge in Final_closed_walk
-                if edge_type in ("sequence edge", "concordant edge", "discordant edge")
-            }
-            f_sequence_edge_val = {
-                edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                for edge, val in f_sequence_edge_val.items()
-            }
-            f_concordant_edge_val = {
-                edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                for edge, val in f_concordant_edge_val.items()
-            }
-            f_discordant_edge_val = {
-                edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                for edge, val in f_discordant_edge_val.items()
-            }
-            # f_sequence_edge_val = {edge: val + val / F_val * delta_F
-            #    for edge, val in f_sequence_edge_val.items()}
-            # #print("f_sequence_after =" , f_sequence_edge_val)
-            # f_concordant_edge_val = {edge: val + val / F_val * delta_F
-            #      for edge, val in f_concordant_edge_val.items()}
-            # f_discordant_edge_val = {edge: val + val / F_val * delta_F
-            #      for edge, val in f_discordant_edge_val.items()}
-            F_val += delta_F
-            end_time_to_update = time.time()
+        F_val, delta_F = increase_component_copy_number(
+            Final_closed_walk, base_F,
+            capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges,
+            f_sequence_edge_val, f_concordant_edge_val, f_discordant_edge_val,
+                             log_context=f"Iteration {Iteration}, Cycle {Cycle_Or_Path_Number}")
+    end_time_to_update = time.time()
             
     final_segment_str = convert_walk_to_segment_string(Final_closed_walk, segments, copy_count=F_val)
     final_segment_str = final_segment_str.replace("Cycle=1", f"Cycle={len(all_closed_walks)+1}")
     Final_Closed_Walk_segments = final_segment_str.split("Segments=")[1].split(',')
     print(f"Finish extracting cycle {Cycle_Or_Path_Number}")
     print("Metric Calculation and Print files")
-    matched_index_set = set(best_cycle_candidate["matched_constraints"])
+    matched_pcs = match_e_constraints(Final_Closed_Walk_segments, Path_Constraints)
+    matched_index_set = set(matched_pcs)
     # write_ILP_cycle_file(segments, ILP_cycle_file_path,final_segment_str, Cycle_Or_Path_Number,
     #                          Final_Closed_Walk_segments, Final_closed_walk_test, Final_closed_walk_completion_test, error_in_closed_walks,
     #                          Path_Constraints, matched_index_set,max_random_search_heuristic_attempts)
@@ -3494,24 +3572,17 @@ while True: #while Iteration==1:
     #weight_ILP_cycle = as_float(weight_ILP_cycle_raw)   # get numeric value
     length_ILP_cycle = weight_ILP_cycle/F_val
     weight_ratio_ILP_cycle.append(weight_ILP_cycle/weight_graph)    
-    weight_ILP_cycle_excluding_some_segments=compute_LWCN_solution_excludeing_some_segments(capacity_sequence_edges_original,sequence_edges,f_sequence_edge_val,length_sequence_edges, Final_closed_walk)                
 
-    length_ILP_cycle_excluding_some_segments = weight_ILP_cycle_excluding_some_segments / F_val
-    weight_ratio_ILP_cycle_excluding_some_segments.append(weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments)
-    total_solution_weight += weight_ILP_cycle_excluding_some_segments
+    total_solution_weight += weight_ILP_cycle
     # write_LWCN_cycle_in_file(LWCN_output_path
     #                          ,weight_ILP_cycle,weight_graph,weight_ratio_ILP_cycle,length_ILP_cycle
-    #                          ,weight_ILP_cycle_excluding_some_segments,weight_graph_excluding_some_segments,weight_ratio_ILP_cycle_excluding_some_segments, length_ILP_cycle_excluding_some_segments
     #                          ,F_val, Cycle_Or_Path_Number,Num_paths)
     Cycle_Info={"Cycle": Cycle_Or_Path_Number,
                 "CopyNumber": F_val,
                 "Segments": Final_Closed_Walk_segments,
                 "Length": length_ILP_cycle,
-                "Length_excluding_segments": length_ILP_cycle_excluding_some_segments,
                 "LWCN": weight_ILP_cycle,  # length-weighted copy number
-                "LWCN_excluding_segments": weight_ILP_cycle_excluding_some_segments,
                 "LWCNR": weight_ILP_cycle/weight_graph,  # length-weighted copy number
-                "LWCNR_excluding_segments": weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments,
                 "Matched_Index_Set": matched_index_set, # This is for the path constraints satisifed
                 }
     if not Final_closed_walk_completion_test :
@@ -3533,43 +3604,18 @@ while True: #while Iteration==1:
         Final_closed_walk_test, test_message = test_closed_walk(Final_closed_walk)
         Final_closed_walk_completion_test = test_merged_closed_walk(Final_closed_walk, sequence_edges, f_sequence_edge_val,
                    discordant_edges, f_discordant_edge_val,
-                   concordant_edges, f_concordant_edge_val, F_val, Path=False)
-        F_val -= delta_F
-        delta_F=0
+                   concordant_edges, f_concordant_edge_val, base_F, Path=False)
+        # Each component starts from this iteration's original solver CN.
+        F_val = base_F
+        delta_F = 0.0
+        start_time_to_update = time.time()
         if not Final_closed_walk_completion_test:
-            #Disconnected_Solutions.append(Cycle_Info) 
-            delta_F=Increase_CN(Final_closed_walk, F_val, capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges)
-            # print("F=", F)
-            # print("Cycle 2 = ", Final_closed_walk)
-            # print("delta_F2 = " ,delta_F)
-            # print("f_sequence_before =" , f_sequence_edge_val)
-            if delta_F>0:
-                start_time_to_update = time.time()
-                walk_edges = {
-                    edge for edge_type, edge in Final_closed_walk
-                    if edge_type in ("sequence edge", "concordant edge", "discordant edge")
-                }
-                f_sequence_edge_val = {
-                    edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                    for edge, val in f_sequence_edge_val.items()
-                }
-                f_concordant_edge_val = {
-                    edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                    for edge, val in f_concordant_edge_val.items()
-                }
-                f_discordant_edge_val = {
-                    edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                    for edge, val in f_discordant_edge_val.items()
-                }
-                # f_sequence_edge_val = {edge: val + val / F_val * delta_F
-                #    for edge, val in f_sequence_edge_val.items()}
-                # print("f_sequence_after =" , f_sequence_edge_val)
-                # f_concordant_edge_val = {edge: val + val / F_val * delta_F
-                #      for edge, val in f_concordant_edge_val.items()}
-                # f_discordant_edge_val = {edge: val + val / F_val * delta_F
-                #      for edge, val in f_discordant_edge_val.items()}
-                F_val += delta_F
-                end_time_to_update = time.time()
+            F_val, delta_F = increase_component_copy_number(
+                Final_closed_walk, base_F,
+                capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges,
+                f_sequence_edge_val, f_concordant_edge_val, f_discordant_edge_val,
+                                 log_context=f"Iteration {Iteration}, Cycle {Cycle_Or_Path_Number}")
+        end_time_to_update = time.time()
         # Write Final_closed_walk as list of segments
         final_segment_str = convert_walk_to_segment_string(Final_closed_walk, segments, copy_count=F_val)
         final_segment_str = final_segment_str.replace("Cycle=1", f"Cycle={len(all_closed_walks)+1}")
@@ -3586,24 +3632,17 @@ while True: #while Iteration==1:
         #weight_ILP_cycle = as_float(weight_ILP_cycle_raw)   # get numeric value
         length_ILP_cycle = weight_ILP_cycle/F_val
         weight_ratio_ILP_cycle.append(weight_ILP_cycle/weight_graph)    
-        weight_ILP_cycle_excluding_some_segments=compute_LWCN_solution_excludeing_some_segments(capacity_sequence_edges_original,sequence_edges,f_sequence_edge_val,length_sequence_edges, Final_closed_walk)                
 
-        length_ILP_cycle_excluding_some_segments = weight_ILP_cycle_excluding_some_segments / F_val
-        weight_ratio_ILP_cycle_excluding_some_segments.append(weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments)
-        total_solution_weight += weight_ILP_cycle_excluding_some_segments
+        total_solution_weight += weight_ILP_cycle
         # write_LWCN_cycle_in_file(LWCN_output_path
         #                          ,weight_ILP_cycle,weight_graph,weight_ratio_ILP_cycle,length_ILP_cycle
-        #                          ,weight_ILP_cycle_excluding_some_segments,weight_graph_excluding_some_segments,weight_ratio_ILP_cycle_excluding_some_segments, length_ILP_cycle_excluding_some_segments
         #                          ,F_val, Cycle_Or_Path_Number,Num_paths)
         Cycle_Info={"Cycle": Cycle_Or_Path_Number,
                     "CopyNumber": F_val,
                     "Segments": Final_Closed_Walk_segments,
                     "Length": length_ILP_cycle,
-                    "Length_excluding_segments": length_ILP_cycle_excluding_some_segments,
                     "LWCN": weight_ILP_cycle,  # length-weighted copy number
-                    "LWCN_excluding_segments": weight_ILP_cycle_excluding_some_segments,
                     "LWCNR": weight_ILP_cycle/weight_graph,  # length-weighted copy number
-                    "LWCNR_excluding_segments": weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments,
                     "Matched_Index_Set": matched_index_set, # This is for the path constraints satisifed
                     }
         if not Final_closed_walk_completion_test :
@@ -3625,6 +3664,9 @@ while True: #while Iteration==1:
 
     Iteration += 1 
     Cycle_Or_Path_Number +=1
+    if stop_after_cycle:
+        Num_cycles = Cycle_Or_Path_Number - 1
+        break
 
 ######## Path solution
 if ENFORCE_CONNECTIVITY:
@@ -3653,7 +3695,7 @@ if args.s_t_strategy == "all_nodes":
         creat_s_t_graph(G, capacity_discordant_edges, K_discordant_edges)
 else:
     sequence_edges_left = {
-        edge for edge, cap in capacity_sequence_edges.items()
+        edge for edge, cap in stable_iter(capacity_sequence_edges.items())
         if cap > 0
     }
     G, nodes, discordant_edges, capacity_discordant_edges, K_discordant_edges = \
@@ -3663,7 +3705,7 @@ print("Start path extraction")
 start=time.time()
 delta_F=0
 while True: # while Iteration==1:
-    ILP_Path_model, variables = path_model_builder(
+    ILP_Path_model, variables= build_path_model(
                     G,
                     nodes,
                     concordant_edges,
@@ -3680,13 +3722,22 @@ while True: # while Iteration==1:
                     p_discordant_edges,
                     path_constraints,
                     ENFORCE_CONNECTIVITY,
-                    gamma) 
+                    gamma,
+                    f_lower_bound) 
     ILP_Path_model.setParam('TimeLimit', TIME_LIMIT_SECONDS)
     print(f"Start running Iteration {Iteration}")
     start_time = time.time()
     ILP_Path_model.optimize()
     end_time = time.time()
     print(f"Finish running Iteration {Iteration}")
+
+    if not optimization_model_has_usable_solution(ILP_Path_model):
+        print(f"Stopping path extraction: status={ILP_Path_model.Status}, solutions={ILP_Path_model.SolCount}")
+        Num_paths = Cycle_Or_Path_Number - Num_cycles - 1
+        break
+    stop_after_path = not optimization_model_is_optimal(ILP_Path_model)
+    if stop_after_path:
+        print("Path time limit reached: saving the feasible incumbent before stopping path extraction.")
 
     X_concordant_edge = variables["X_concordant_edge"]
     X_discordant_edge= variables["X_discordant_edge"]
@@ -3699,17 +3750,28 @@ while True: # while Iteration==1:
     y_discordant = variables["y_discordant"]
     z_discordant = variables["z_discordant"]
     
-    X_concordant_edge_val  = {k: float(v.X) for k, v in X_concordant_edge.items()}
-    X_discordant_edge_val  = {k: float(v.X) for k, v in X_discordant_edge.items()}
-    X_sequence_edge_val    = {k: float(v.X) for k, v in X_sequence_edge.items()}
-    f_concordant_edge_val  = {k: float(v.X) for k, v in f_concordant_edge.items()}
-    f_discordant_edge_val  = {k: float(v.X) for k, v in f_discordant_edge.items()}
-    f_sequence_edge_val    = {k: float(v.X) for k, v in f_sequence_edge.items()}
+    X_concordant_edge_val  = {k: float(v.X) for k, v in stable_iter(X_concordant_edge.items())}
+    X_discordant_edge_val  = {k: float(v.X) for k, v in stable_iter(X_discordant_edge.items())}
+    X_sequence_edge_val    = {k: float(v.X) for k, v in stable_iter(X_sequence_edge.items())}
+    f_concordant_edge_val  = {k: float(v.X) for k, v in stable_iter(f_concordant_edge.items())}
+    f_discordant_edge_val  = {k: float(v.X) for k, v in stable_iter(f_discordant_edge.items())}
+    f_sequence_edge_val    = {k: float(v.X) for k, v in stable_iter(f_sequence_edge.items())}
     F_val = float(F.X)
-    P_val = {k: float(v.X) for k, v in P.items()}
+    base_F = F_val
+    P_val = {k: float(v.X) for k, v in stable_iter(P.items())}
+    print_iteration_solution(
+        Iteration, "Path", ILP_Path_model, F_val,
+        f_sequence_edge_val, X_sequence_edge_val, length_sequence_edges,
+        f_concordant_edge_val, X_concordant_edge_val,
+        f_discordant_edge_val, X_discordant_edge_val)
+
     
-    if not optimization_model_is_optimal(ILP_Path_model) or total_solution_weight > 0.9*weight_graph or F_val<1:
-        Num_paths=Cycle_Or_Path_Number-Num_cycles-1
+    if (
+        total_solution_weight > 0.9 * weight_graph
+        or F_val < 0.5
+    ):
+        log_stopping_cutoffs("Path", Iteration, F_val, total_solution_weight, weight_graph)
+        Num_paths = Cycle_Or_Path_Number - Num_cycles - 1
         break
     max_random_search_heuristic_attempts = 100       
     # if ENFORCE_CONNECTIVITY:
@@ -3726,58 +3788,31 @@ while True: # while Iteration==1:
         discordant_edges, f_discordant_edge_val,
         concordant_edges, f_concordant_edge_val,
         segments, Path_Constraints, F_val,
-        candidate_runs=max_random_search_heuristic_attempts,
-    )
-    print(
-        f"Selected the best of {max_random_search_heuristic_attempts} s-t-walk candidates; "
-        f"matched {len(best_path_candidate['matched_constraints'])} path constraints."
-    )
+        candidate_runs=max_random_search_heuristic_attempts)
+    print(f"Selected the best of {max_random_search_heuristic_attempts} s-t-walk candidates; "
+          f"matched {len(best_path_candidate['matched_constraints'])} path constraints.")
     s_t_Walk = best_path_candidate["walks"]
     error_in_closed_walks = best_path_candidate["construction_error"]
     merged_s_t_walk = best_path_candidate["merged_walk"]
     not_merged_closed_walks_to_s_t_path = best_path_candidate["not_merged_walks"]
     final_segment_str = best_path_candidate["segment_string"]
     final_segment_str = re.sub(r"Path=\d+", f"Path={Cycle_Or_Path_Number}", final_segment_str)
-    parts = final_segment_str.split(';', 1)  # split at first semicolon
+    parts = final_segment_str.split(';', 1)
     Final_s_t_Walk_segments = list(best_path_candidate["segments"])
     Final_s_t_Walk = Final_s_t_Walk_segments
     matched_index_set = set(best_path_candidate["matched_constraints"])
     Final_s_t_walk_completion_test = best_path_candidate["completion_test"]
-    F_val -= delta_F
-    delta_F=0
+    # Each component starts from this iteration's original solver CN.
+    F_val = base_F
+    delta_F = 0.0
+    start_time_to_update = time.time()
     if not Final_s_t_walk_completion_test:
-        delta_F=Increase_CN(s_t_Walk[0], F_val, capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges)
-        # print("F=", F)
-        # print("Cpath 3 = ", Final_closed_walk)
-        # print("delta_F3 = " ,delta_F)
-        # print("f_sequence_before =" , f_sequence_edge_val)
-        if delta_F>0:
-            start_time_to_update = time.time()
-            walk_edges = {
-                edge for edge_type, edge in Final_closed_walk
-                if edge_type in ("sequence edge", "concordant edge", "discordant edge")
-            }
-            f_sequence_edge_val = {
-                edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                for edge, val in f_sequence_edge_val.items()
-            }
-            f_concordant_edge_val = {
-                edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                for edge, val in f_concordant_edge_val.items()
-            }
-            f_discordant_edge_val = {
-                edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                for edge, val in f_discordant_edge_val.items()
-            }
-            # f_sequence_edge_val = {edge: val + val / F_val * delta_F
-            #    for edge, val in f_sequence_edge_val.items()}
-            # print("f_sequence_after =" , f_sequence_edge_val)
-            # f_concordant_edge_val = {edge: val + val / F_val * delta_F
-            #      for edge, val in f_concordant_edge_val.items()}
-            # f_discordant_edge_val = {edge: val + val / F_val * delta_F
-            #      for edge, val in f_discordant_edge_val.items()}
-            F_val += delta_F
-            end_time_to_update = time.time() 
+        F_val, delta_F = increase_component_copy_number(
+            s_t_Walk[0], base_F,
+            capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges,
+            f_sequence_edge_val, f_concordant_edge_val, f_discordant_edge_val,
+                             log_context=f"Iteration {Iteration}, Path {Cycle_Or_Path_Number}")
+    end_time_to_update = time.time()
     # write_paths_in_ILP_cycle_file(original_cycle_file, new_output_file,final_segment_str, 
     #                          Final_s_t_Walk_segments, Path_Constraints, matched_index_set,Cycle_Or_Path_Number,Final_s_t_walk_completion_test)
     # write_paths_in_ILP_cycle_file(segments, ILP_cycle_file_path, final_segment_str, Iteration,Path_Constraints, matched_index_set)
@@ -3787,23 +3822,16 @@ while True: # while Iteration==1:
     weight_ILP_path =compute_Length_weighted_copy_number_solution(sequence_edges,f_sequence_edge_val,length_sequence_edges, s_t_Walk[0])                 
     length_ILP_path = weight_ILP_path/F_val    
     weight_ratio_ILP_path.append(weight_ILP_path/weight_graph)
-    weight_ILP_path_excluding_some_segments=compute_LWCN_solution_excludeing_some_segments(capacity_sequence_edges_original,sequence_edges,f_sequence_edge_val,length_sequence_edges, s_t_Walk[0])
-    length_ILP_path_excluding_some_segments = weight_ILP_path_excluding_some_segments /F_val
-    weight_ratio_ILP_path_excluding_some_segments.append(weight_ILP_path_excluding_some_segments/weight_graph_excluding_some_segments)
-    total_solution_weight += weight_ILP_path_excluding_some_segments
+    total_solution_weight += weight_ILP_path
     # write_LWCN_path_in_file(LWCN_output_path
     #                          ,weight_ILP_path,weight_graph,weight_ratio_ILP_path,length_ILP_path
-    #                          ,weight_ILP_path_excluding_some_segments,weight_graph_excluding_some_segments,weight_ratio_ILP_path_excluding_some_segments, length_ILP_path_excluding_some_segments
     #                          ,F_val,Cycle_Or_Path_Number,Num_cycles)
     Path_Info={"Path": Cycle_Or_Path_Number,
                "CopyNumber": F_val,
                 "Segments": Final_s_t_Walk_segments,
                 "Length": length_ILP_path,
-                "Length_excluding_segments": length_ILP_path_excluding_some_segments,
                 "LWCN": weight_ILP_path,  # length-weighted copy number
-                "LWCN_excluding_segments": weight_ILP_path_excluding_some_segments,
                 "LWCNR": weight_ILP_path/weight_graph,  # length-weighted copy number
-                "LWCNR_excluding_segments": weight_ILP_path_excluding_some_segments/weight_graph_excluding_some_segments,
                 "Matched_Index_Set": matched_index_set, # This is for the path constraints satisifed
                 }
     All_Paths.append(Path_Info) 
@@ -3822,43 +3850,18 @@ while True: # while Iteration==1:
         Final_closed_walk_test, test_message = test_closed_walk(Final_closed_walk)
         Final_closed_walk_completion_test = test_merged_closed_walk(Final_closed_walk, sequence_edges, f_sequence_edge_val,
                    discordant_edges, f_discordant_edge_val,
-                   concordant_edges, f_concordant_edge_val, F_val, Path=False)
-        F_val -= delta_F
-        delta_F=0
+                   concordant_edges, f_concordant_edge_val, base_F, Path=False)
+        # Each component starts from this iteration's original solver CN.
+        F_val = base_F
+        delta_F = 0.0
+        start_time_to_update = time.time()
         if not Final_closed_walk_completion_test:
-            #Disconnected_Solutions.append(Cycle_Info)
-            delta_F=Increase_CN(Final_closed_walk, F_val, capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges)
-            # print("F=", F)
-            # print("Cycle 4 = ", Final_closed_walk)
-            # print("delta_F4 = " ,delta_F)
-            # print("f_sequence_before =" , f_sequence_edge_val)
-            if delta_F>0:
-                start_time_to_update = time.time()
-                walk_edges = {
-                    edge for edge_type, edge in Final_closed_walk
-                    if edge_type in ("sequence edge", "concordant edge", "discordant edge")
-                }
-                f_sequence_edge_val = {
-                    edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                    for edge, val in f_sequence_edge_val.items()
-                }
-                f_concordant_edge_val = {
-                    edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                    for edge, val in f_concordant_edge_val.items()
-                }
-                f_discordant_edge_val = {
-                    edge: val + (val / F_val) * delta_F if edge in walk_edges else val
-                    for edge, val in f_discordant_edge_val.items()
-                }
-                # f_sequence_edge_val = {edge: val + val / F_val * delta_F
-                #    for edge, val in f_sequence_edge_val.items()}
-                # print("f_sequence_after =" , f_sequence_edge_val)
-                # f_concordant_edge_val = {edge: val + val / F_val * delta_F
-                #      for edge, val in f_concordant_edge_val.items()}
-                # f_discordant_edge_val = {edge: val + val / F_val * delta_F
-                #      for edge, val in f_discordant_edge_val.items()}
-                F_val += delta_F
-                end_time_to_update = time.time()
+            F_val, delta_F = increase_component_copy_number(
+                Final_closed_walk, base_F,
+                capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges,
+                f_sequence_edge_val, f_concordant_edge_val, f_discordant_edge_val,
+                                 log_context=f"Iteration {Iteration}, Cycle {Cycle_Or_Path_Number}")
+        end_time_to_update = time.time()
                 
         # Write Final_closed_walk as list of segments
         final_segment_str = convert_walk_to_segment_string(Final_closed_walk, segments, copy_count=F_val)
@@ -3876,25 +3879,18 @@ while True: # while Iteration==1:
 
         length_ILP_cycle = weight_ILP_cycle/F_val
         weight_ratio_ILP_cycle.append(weight_ILP_cycle/weight_graph)
-        weight_ILP_cycle_excluding_some_segments=compute_LWCN_solution_excludeing_some_segments(capacity_sequence_edges_original,sequence_edges,f_sequence_edge_val,length_sequence_edges, Final_closed_walk)                
 
-        length_ILP_cycle_excluding_some_segments = weight_ILP_cycle_excluding_some_segments/F_val
-        weight_ratio_ILP_cycle_excluding_some_segments.append(weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments)
 
-        total_solution_weight += weight_ILP_cycle_excluding_some_segments
+        total_solution_weight += weight_ILP_cycle
         # write_LWCN_cycle_in_file(LWCN_output_path
         #                          ,weight_ILP_cycle,weight_graph,weight_ratio_ILP_cycle,length_ILP_cycle
-        #                          ,weight_ILP_cycle_excluding_some_segments,weight_graph_excluding_some_segments,weight_ratio_ILP_cycle_excluding_some_segments, length_ILP_cycle_excluding_some_segments
         #                          ,F_val, Cycle_Or_Path_Number,Num_paths)
         Cycle_Info={"Cycle": Cycle_Or_Path_Number,
                     "CopyNumber": F_val,
                     "Segments": Final_Closed_Walk_segments,
                     "Length": length_ILP_cycle,
-                    "Length_excluding_segments": length_ILP_cycle_excluding_some_segments,
                     "LWCN": weight_ILP_cycle,  # length-weighted copy number
-                    "LWCN_excluding_segments": weight_ILP_cycle_excluding_some_segments,
                     "LWCNR": weight_ILP_cycle/weight_graph,  # length-weighted copy number
-                    "LWCNR_excluding_segments": weight_ILP_cycle_excluding_some_segments/weight_graph_excluding_some_segments,
                     "Matched_Index_Set": matched_index_set, # This is for the path constraints satisifed
                     }
         if not Final_closed_walk_completion_test :
@@ -3914,37 +3910,43 @@ while True: # while Iteration==1:
     capacity_concordant_edges, capacity_discordant_edges, capacity_sequence_edges = update_the_graph(concordant_edges, f_concordant_edge_val, X_concordant_edge_val, capacity_concordant_edges,
                          discordant_edges, f_discordant_edge_val, X_discordant_edge_val, capacity_discordant_edges,
                          sequence_edges, f_sequence_edge_val, X_sequence_edge_val, capacity_sequence_edges)
-    Iteration += 1 
-# All_Cycles_Ordered = sorted(All_Cycles, key=lambda x: x["LWCN_excluding_segments"], reverse=True)
-# All_Paths_Ordered = sorted(All_Paths, key=lambda x: x["LWCN_excluding_segments"], reverse=True)
-# All_Cycles_Ordered = sorted(All_Cycles, key=lambda x: x["CopyNumber"], reverse=True)
-# All_Paths_Ordered = sorted(All_Paths, key=lambda x: x["CopyNumber"], reverse=True)
+    Iteration += 1
+    if stop_after_path:
+        break
+# All_Cycles_Ordered = sorted(All_Cycles, key=lambda x: (round(x["CopyNumber"], 8), tuple(x["Segments"])), reverse=True)
+# All_Paths_Ordered = sorted(All_Paths, key=lambda x: (round(x["CopyNumber"], 8), tuple(x["Segments"])), reverse=True)
+
+# Canonicalize equivalent structures before sorting and writing.
+for component in stable_iter(All_Cycles):
+    component["Segments"] = canonical_segments(component["Segments"], circular=True)
+for component in stable_iter(All_Paths):
+    component["Segments"] = canonical_segments(component["Segments"], circular=False)
 
 #Determine sorting key
 if args.sort_by == "CopyNumber":
-    cycle_sort_key = lambda x: x["CopyNumber"]
+    cycle_sort_key = lambda x: (round(x["CopyNumber"], 8), tuple(x["Segments"]))
 else:  # LWCN
-    cycle_sort_key = lambda x: x["LWCN_excluding_segments"]
+    cycle_sort_key = lambda x: (round(x["LWCN"], 8), tuple(x["Segments"]))
 
 # Sort cycles and paths
 All_Cycles_Ordered = sorted(All_Cycles, key=cycle_sort_key, reverse=True)
 All_Paths_Ordered = sorted(All_Paths, key=cycle_sort_key, reverse=True)
 
-for i, cycle in enumerate(All_Cycles_Ordered, start=1):
+for i, cycle in stable_iter(enumerate(All_Cycles_Ordered, start=1)):
     cycle["New_Order_Of_Cycle_Number"] = i
-for i, path in enumerate(All_Paths_Ordered, start=1):
+for i, path in stable_iter(enumerate(All_Paths_Ordered, start=1)):
     path["New_Order_Of_Path_Number"] = i+Num_cycles
 
 # Add new order numbers to disconnected solutions (keep the same dicts)
-for item in Disconnected_Solutions:
+for item in stable_iter(Disconnected_Solutions):
     if "Cycle" in item:
         # Find the cycle in All_Cycles_Ordered that matches the original number
-        for cycle in All_Cycles_Ordered:
+        for cycle in stable_iter(All_Cycles_Ordered):
             if cycle["Cycle"] == item["Cycle"]:
                 item["New_Order_Of_Cycle_Number"] = cycle["New_Order_Of_Cycle_Number"]
                 break
     elif "Path" in item:
-        for path in All_Paths_Ordered:
+        for path in stable_iter(All_Paths_Ordered):
             if path["Path"] == item["Path"]:
                 item["New_Order_Of_Path_Number"] = path["New_Order_Of_Path_Number"]
                 break
