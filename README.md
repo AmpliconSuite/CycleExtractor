@@ -144,6 +144,9 @@ A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it i
 |`--cycles-to-fasta-script`|	Path to the cycles_file_to_fasta.py Script from the ecSimulator project.|	~/ecSimulator/src/cycles_file_to_fasta.py
 |`--solver <highs\|gurobi>`|	Choose the optimization solver.|	gurobi
 |`--time-limit-seconds`|	Choose the time limit for each cycle or path iteration in second|	7200 second (2 hours)
+|`--max-multiplicity`|	Choose the upper bound for the multiplicity of discordant edges|	5
+|`--time-limit-seconds`|	Choose the time limit for each cycle or path iteration in second|	7200 second (2 hours)
+|`--f-lower-bound`|	Choose the lower bound for the copy number of the cycle or path|	0
 
 # Starting from bam files
 
