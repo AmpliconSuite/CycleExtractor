@@ -3369,6 +3369,22 @@ if bool(args.fasta_output) != bool(args.ref):
 # Resolve paths
 # -----------------------------------------
 graph_file_path = Path(args.graph).resolve()
+# Check the graph file up front so a bad path gives a one-line error rather
+# than a traceback from deep inside graph construction.
+if not graph_file_path.exists():
+    parser.error(f"--graph: no such file: {args.graph}")
+if not graph_file_path.is_file():
+    parser.error(f"--graph: not a regular file: {args.graph}")
+try:
+    with open(graph_file_path) as graph_handle:
+        graph_has_sequence_edges = any(line.startswith("sequence") for line in graph_handle)
+except (OSError, UnicodeDecodeError) as exc:
+    parser.error(f"--graph: cannot read {args.graph}: {exc}")
+if not graph_has_sequence_edges:
+    parser.error(
+        f"--graph: {args.graph} has no 'sequence' lines; expected an "
+        "AmpliconArchitect or CoRAL breakpoint graph (*_graph.txt)."
+    )
 #cycles_file_path = Path(args.output).resolve()
 #output_dir = cycles_file_path.parent   # directory containing the graph
 output_file = Path(args.output).resolve()
@@ -3406,10 +3422,11 @@ amplicon_name = amplicon_file_name.replace("_graph.txt", "")  # e.g., "amplicon1
 # match = re.search(r"amplicon(\d+)", amplicon_name.lower())
 # amplicon_num = match.group(1) # e.g., "1"
 
-if ENFORCE_CONNECTIVITY:
-    log_file = output_dir / "ILP_Connectivity_log.txt"
-else:
-    log_file = output_dir / "ILP_log.txt"
+# Name the log after the output file so several runs writing to one directory
+# (e.g. one per amplicon) do not overwrite each other's logs:
+# X_cycles.txt -> X_cycles_ILP_log.txt (or X_cycles_ILP_Connectivity_log.txt).
+log_suffix = "_ILP_Connectivity_log.txt" if ENFORCE_CONNECTIVITY else "_ILP_log.txt"
+log_file = output_dir / (output_file.stem + log_suffix)
 if args.log_file:
     log_file = args.log_file
 
