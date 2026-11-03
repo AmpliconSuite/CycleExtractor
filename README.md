@@ -146,7 +146,7 @@ A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it i
 | ------------- | ------------- |------------- |
 |`--graph`|	Path to the input breakpoint graph file. **(required)** | -	
 |`--output`|	Path to the output file where cycles/paths will be written.	**(required)** | -
-|`--gamma`|	Weight balancing number of subwalk constraint satisfied vs. length weighted copy number included ($\sum_{(u,v)\in E}CN(u,v)\cdot l_{uv}$) in MILP objective, larger value favors number of subwalks satisfied.	|`0.01`
+|`--gamma`|	Weight balancing number of subwalk constraint satisfied vs. length weighted copy number included ($\sum_{(u,v)\in E}CN(u,v)\cdot l_{uv}$) in MILP objective, larger value favors number of subwalks satisfied. Must be ≥ 0.	|`0.01`
 |`--sort-by <CopyNumber\|LWCN>`|	Sort output cycles by their copy numbers or length weighted copy number.	|`CopyNumber`
 |`--s-t-strategy <all_nodes\|intervals>`| Choose whether to connect source/sink nodes to all nodes or only to interval start/end nodes.	| `all_nodes`
 |`--enforce-connectivity`|	CEc mode, which outputs a single connected cycle/s,t-walk at each iteration. Without it, CE reports each disconnected part of a solution as its own cycle or walk (see [When CE stops](#when-ce-stops)); this is potentially faster than CEc. |	off
@@ -158,7 +158,7 @@ A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it i
 |`--time-limit-seconds`|	Time limit, in seconds, for each cycle or path MILP. When it is reached, CE keeps the best solution found so far and ends that extraction stage.|	7200 (2 hours)
 |`--max-multiplicity`|	Choose the upper bound for the multiplicity of discordant edges|	5
 |`--seed`|	Random seed for Python, NumPy and the solver, 0..2000000000. Runs with the same seed give identical output.|	0
-|`--f-lower-bound`|	Optional lower bound on the MILP copy number `F` of each cycle or path.|	none (no bound)
+|`--f-lower-bound`|	Optional lower bound (≥ 0) on the MILP copy number `F` of each cycle or path.|	none (no bound)
 |`--log_file`|	Path to the run log.|	`<output name>_ILP_log.txt` next to `--output` (`_ILP_Connectivity_log.txt` with `--enforce-connectivity`)
 
 # Starting from bam files

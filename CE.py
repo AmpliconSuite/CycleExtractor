@@ -7,6 +7,7 @@ try:
 except ImportError:
     highspy = None
 Model, GRB = GurobiModel, GurobiGRB
+import math
 import re
 import networkx as nx
 import random
@@ -3270,6 +3271,23 @@ def positive_int(value):
     return parsed_value
 
 
+def nonnegative_float(value):
+    """Argparse type for a finite float >= 0 (used for --gamma and --f-lower-bound).
+
+    float() accepts "nan" and "inf", and either would silently corrupt the
+    objective or the F constraint, so both are rejected here.
+    """
+    try:
+        parsed_value = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed_value):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    if parsed_value < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed_value
+
+
 MAX_SEED = 2_000_000_000  # Upper bound accepted for the solver/Python/NumPy seed.
 
 
@@ -3304,7 +3322,7 @@ parser.add_argument(
     help="Time limit for each cycle/path optimization in seconds (default: 7200 = 2 hours).",
 )
 parser.add_argument("--enforce-connectivity",action="store_true",help="Enable connectivity-enforced ILP (default = off)")
-parser.add_argument("--gamma",type=float,default=0.01,help="Gamma value (default = 0.01)")
+parser.add_argument("--gamma",type=nonnegative_float,default=0.01,help="Gamma value, >= 0 (default = 0.01)")
 parser.add_argument(
     "--max-multiplicity",
     type=positive_int,
@@ -3316,10 +3334,10 @@ parser.add_argument(
 )
 parser.add_argument(
     "--f-lower-bound",
-    type=float,
+    type=nonnegative_float,
     default=None,
     help=(
-        "Optional lower bound for the model variable F. When omitted, no "
+        "Optional lower bound (>= 0) for the model variable F. When omitted, no "
         "user-defined lower-bound constraint is added."
     ),
 )
