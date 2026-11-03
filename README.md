@@ -103,8 +103,14 @@ CE writes the extracted cycles representing potential ecDNA (and s,t-walks, repr
 - the segments (and orientations) in order composing the cycle, and
 - the list of subwalk constraints it can satisfy.
 
-By default, cycles (and walks) are sorted by their copy numbers (see the `--sort-by` option to set up alternative orders by length weighted copy numbers). An example [cycles file](https://github.com/AmpliconSuite/CycleExtractor/blob/main/sample_data/GBM39EC_EGFR_cycles.txt):
+By default, cycles (and walks) are sorted by their copy numbers (see the `--sort-by` option to set up alternative orders by length weighted copy numbers).
+
+The file uses the [CoRAL](https://github.com/AmpliconSuite/CoRAL) cycles-file layout, an extension of the AmpliconArchitect format, so CoRAL's tools (e.g. `coral cycle2bed`) can read it. It starts with a `#CycleExtractor <version>` header line and `Interval` lines for the amplified regions. Each subwalk constraint is marked `Satisfied` if at least one reported cycle or path satisfies it, and `Unsatisfied` otherwise. When the graph has no subwalk constraints, the constraint section and the `Path_constraints_satisfied` field are omitted, as in CoRAL.
+
+An example [cycles file](https://github.com/AmpliconSuite/CycleExtractor/blob/main/sample_data/GBM39EC_EGFR_cycles.txt):
 ```
+#CycleExtractor 1.1.0
+Interval	1	chr7	54659673	56149664
 List of cycle segments
 Segment	1	chr7	54659673	54763281
 Segment	2	chr7	54763282	55127266
@@ -114,10 +120,10 @@ Segment	5	chr7	55609191	55610094
 Segment	6	chr7	55610095	56049369
 Segment	7	chr7	56049370	56149664
 List of longest subpath constraints
-Path constraint	1	e2+:1,c2-:1,e3+:1,c3-:1,e4+:1	Support=6	N/A
-Path constraint	2	e4+:1,c4-:1,e5+:1,c5-:1,e6+:1	Support=34	N/A
+Path constraint 1	e2+:1,c2-:1,e3+:1,c3-:1,e4+:1	Support=6	Unsatisfied
+Path constraint 2	e4+:1,c4-:1,e5+:1,c5-:1,e6+:1	Support=34	Unsatisfied
 List of extracted cycles/paths
-Cycle=1;Copy_count=85.18981770204846;Segments=2+,4+,6+;Path_constraints_satisfied=
+Cycle=1;Copy_count=85.18981770;Segments=2+,4+,6+;Path_constraints_satisfied=
 ```
 
 # Optional Output
@@ -145,7 +151,7 @@ A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it i
 |`--solver <highs\|gurobi>`|	Choose the optimization solver.|	gurobi
 |`--time-limit-seconds`|	Choose the time limit for each cycle or path iteration in second|	7200 second (2 hours)
 |`--max-multiplicity`|	Choose the upper bound for the multiplicity of discordant edges|	5
-|`--time-limit-seconds`|	Choose the time limit for each cycle or path iteration in second|	7200 second (2 hours)
+|`--seed`|	Random seed for Python, NumPy and the solver, 0..2000000000. Runs with the same seed give identical output.|	0
 |`--f-lower-bound`|	Choose the lower bound for the copy number of the cycle or path|	0
 
 # Starting from bam files
