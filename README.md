@@ -105,6 +105,12 @@ CE writes the extracted cycles representing potential ecDNA (and s,t-walks, repr
 
 By default, cycles (and walks) are sorted by their copy numbers (see the `--sort-by` option to set up alternative orders by length weighted copy numbers).
 
+## When CE stops
+CE extracts one solution per iteration, cycles first and then s,t-walks (paths). Each iteration solves a MILP whose copy number is `F`, and the accepted solution's flow is subtracted from the graph before the next iteration.
+- Cycle extraction stops when `F < 0.5`, or when the results accepted so far explain more than 90% of the graph's length-weighted copy number (the sum over segments of copy number × length). The solution that triggers the stop is discarded. Path extraction then runs and stops under the same two rules.
+- If a MILP reaches `--time-limit-seconds`, CE keeps the best solution the solver found and ends that stage. A time-out during cycle extraction still lets path extraction run.
+- Without `--enforce-connectivity`, a solution can have several disconnected parts. Each part is reported as its own cycle or path, and its copy number is raised to use any capacity left on its own edges, so a reported `Copy_count` can be larger than that iteration's `F`.
+
 The file uses the [CoRAL](https://github.com/AmpliconSuite/CoRAL) cycles-file layout, an extension of the AmpliconArchitect format, so CoRAL's tools (e.g. `coral cycle2bed`) can read it. It starts with a `#CycleExtractor <version>` header line and `Interval` lines for the amplified regions. Each subwalk constraint is marked `Satisfied` if at least one reported cycle or path satisfies it, and `Unsatisfied` otherwise. When the graph has no subwalk constraints, the constraint section and the `Path_constraints_satisfied` field are omitted, as in CoRAL.
 
 An example [cycles file](https://github.com/AmpliconSuite/CycleExtractor/blob/main/sample_data/GBM39EC_EGFR_cycles.txt):
@@ -143,16 +149,17 @@ A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it i
 |`--gamma`|	Weight balancing number of subwalk constraint satisfied vs. length weighted copy number included ($\sum_{(u,v)\in E}CN(u,v)\cdot l_{uv}$) in MILP objective, larger value favors number of subwalks satisfied.	|`0.01`
 |`--sort-by <CopyNumber\|LWCN>`|	Sort output cycles by their copy numbers or length weighted copy number.	|`CopyNumber`
 |`--s-t-strategy <all_nodes\|intervals>`| Choose whether to connect source/sink nodes to all nodes or only to interval start/end nodes.	| `all_nodes`
-|`--enforce-connectivity`|	CEc mode, which outputs a single connected cycle/s,t-walk at each iteration. CE simply returns the cycle (or walk) with maximum CN when multiple disjoint cycles are produced due to the lack of connectivity constraints, making it potentially faster than CEc. |	off
+|`--enforce-connectivity`|	CEc mode, which outputs a single connected cycle/s,t-walk at each iteration. Without it, CE reports each disconnected part of a solution as its own cycle or walk (see [When CE stops](#when-ce-stops)); this is potentially faster than CEc. |	off
 |`--version`|	Print CE version and exit.|	-
 |`--fasta-output`|	Path to the output file where the fasta cycles file will be written.|	-
 |`--ref`|	Path to the hg38. Required only when --fasta-output is used.|	-
 |`--cycles-to-fasta-script`|	Path to the cycles_file_to_fasta.py Script from the ecSimulator project.|	~/ecSimulator/src/cycles_file_to_fasta.py
 |`--solver <highs\|gurobi>`|	Choose the optimization solver.|	gurobi
-|`--time-limit-seconds`|	Choose the time limit for each cycle or path iteration in second|	7200 second (2 hours)
+|`--time-limit-seconds`|	Time limit, in seconds, for each cycle or path MILP. When it is reached, CE keeps the best solution found so far and ends that extraction stage.|	7200 (2 hours)
 |`--max-multiplicity`|	Choose the upper bound for the multiplicity of discordant edges|	5
 |`--seed`|	Random seed for Python, NumPy and the solver, 0..2000000000. Runs with the same seed give identical output.|	0
-|`--f-lower-bound`|	Choose the lower bound for the copy number of the cycle or path|	0
+|`--f-lower-bound`|	Optional lower bound on the MILP copy number `F` of each cycle or path.|	none (no bound)
+|`--log_file`|	Path to the run log.|	`<output name>_ILP_log.txt` next to `--output` (`_ILP_Connectivity_log.txt` with `--enforce-connectivity`)
 
 # Starting from bam files
 
