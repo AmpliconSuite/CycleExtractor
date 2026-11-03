@@ -3235,14 +3235,33 @@ def positive_int(value):
     return parsed_value
 
 
+MAX_SEED = 2_000_000_000  # Upper bound accepted for the solver/Python/NumPy seed.
+
+
+def seed_int(value):
+    """Argparse type for --seed: an integer in [0, MAX_SEED].
+
+    Validated here rather than with choices=range(...): argparse expands
+    `choices` into a string when printing --help or an error, which for a
+    range of 2 billion integers exhausts memory.
+    """
+    try:
+        parsed_value = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 0 <= parsed_value <= MAX_SEED:
+        raise argparse.ArgumentTypeError(f"must be between 0 and {MAX_SEED}")
+    return parsed_value
+
+
 parser = argparse.ArgumentParser(description="Run Cycle Extractor ILP Solver.")
 parser.add_argument("--graph", required=True, help="Path to input graph file.")
 parser.add_argument("--output", required=True, help="Path to output cycles file.")
 parser.add_argument("--log_file", help="Optional, path to log file.")
 parser.add_argument("--solver", choices=["gurobi", "highs"], default="gurobi",
                     help="Optimization backend (default: gurobi).")
-parser.add_argument("--seed", type=int, choices=range(0, 2000000001), default=0,
-                    metavar="N", help="Python/NumPy/Gurobi random seed, 0..2000000000 (default: 0).")
+parser.add_argument("--seed", type=seed_int, default=0, metavar="N",
+                    help=f"Python/NumPy/Gurobi random seed, 0..{MAX_SEED} (default: 0).")
 parser.add_argument(
     "--time-limit-seconds",
     type=positive_int,
