@@ -7,6 +7,7 @@ try:
 except ImportError:
     highspy = None
 Model, GRB = GurobiModel, GurobiGRB
+import math
 import re
 import networkx as nx
 import random
@@ -3098,21 +3099,64 @@ def write_LWCN_path_in_file(metrics_output_path
                 f.write(f"{'weight ratio of ILP path':<40}: {weight_ratio_path_ILP[Iteration-Num_cycles-1]:.4f}\n")
                 f.write("\n")
 
+def cycles_file_chr_sort_key(name):
+    """Chromosome order used for Interval lines; same order as CoRAL's chr_sort_key.
+
+    Autosomes numerically, then X, Y, M/MT, then any other contig lexicographically.
+    """
+    stem = name[3:] if name[:3].lower() == "chr" else name
+    if stem.isdigit():
+        return (0, int(stem), "")
+    if stem.upper() == "X":
+        return (1, 0, "")
+    if stem.upper() == "Y":
+        return (1, 1, "")
+    if stem.upper() in ("M", "MT"):
+        return (2, 0, "")
+    return (3, 0, stem)
+
+
+def amplicon_intervals_from_segments(segments):
+    """Rebuild the amplicon intervals for the Interval lines of the cycles file.
+
+    The graph file has no interval records, but its sequence edges tile each
+    amplified interval without gaps, so merging segments that are adjacent on
+    the same chromosome (next start == previous end + 1) recovers them. On the
+    112 CoRAL 2.2.0 graphs in the "CoRAL cell lines" AmpliconRepository project
+    this reproduces CoRAL's own Interval lines exactly.
+    """
+    ordered = sorted(
+        ((seg["chrom"], seg["start"], seg["end"]) for seg in stable_iter(segments.values())),
+        key=lambda s: (cycles_file_chr_sort_key(s[0]), s[1], s[2]),
+    )
+    intervals = []
+    for chrom, start, end in stable_iter(ordered):
+        if intervals and intervals[-1][0] == chrom and start == intervals[-1][2] + 1:
+            intervals[-1][2] = max(intervals[-1][2], end)
+        else:
+            intervals.append([chrom, start, end])
+    return intervals
+
+
 def write_all_cycles_and_paths(segments, new_output_file, all_cycles_ordered, all_paths_ordered, path_constraints):
     """
-    Writes all cycles and all paths at once, in the order provided.
-    If the file doesn't exist, writes the list of segments and path constraints first.
+    Write the cycles file in the CoRAL cycles-file layout (an extension of the
+    AmpliconArchitect format): a version header, Interval lines, segments,
+    longest subpath constraints with Satisfied/Unsatisfied, then all cycles and
+    paths in the order provided.
     """
+    # A constraint is "Satisfied" when at least one reported cycle or path
+    # satisfies it, the same rule CoRAL uses.
+    satisfied_pc_indices = set()
+    for walk in stable_iter(list(all_cycles_ordered) + list(all_paths_ordered)):
+        satisfied_pc_indices.update(walk.get("Matched_Index_Set", set()))
 
-    # import os
-    # first_write = not os.path.exists(new_output_file)
-
-    # Open file in write mode if new, else append
-   # with open(new_output_file, "w" if first_write else "a") as out_f:
     with open(new_output_file, "w") as out_f:
-        # --- Write segments and path constraints if first write ---
-       # if first_write:
-            # List of cycle segments
+        out_f.write(f"#CycleExtractor {__version__}\n")
+
+        for interval_num, (chrom, start, end) in enumerate(amplicon_intervals_from_segments(segments), start=1):
+            out_f.write(f"Interval\t{interval_num}\t{chrom}\t{start}\t{end}\n")
+
         out_f.write("List of cycle segments\n")
         for seg_id in stable_iter(sorted(segments.keys())):
             seg = segments[seg_id]
@@ -3120,44 +3164,36 @@ def write_all_cycles_and_paths(segments, new_output_file, all_cycles_ordered, al
                 f"Segment\t{seg['id']}\t{seg['chrom']}\t{seg['start']}\t{seg['end']}\n"
             )
 
-        # List of path constraints
-        out_f.write("List of longest subpath constraints\n")
+        # Like CoRAL, the constraint section and the per-walk
+        # Path_constraints_satisfied field appear only when the graph has
+        # path constraints. CoRAL separates "Path constraint" and its index
+        # with a space, not a tab.
         if path_constraints:
+            out_f.write("List of longest subpath constraints\n")
             for pc in stable_iter(path_constraints):
-                # For now, no cycle-specific match info; just list constraints
+                status = "Satisfied" if pc["index"] in satisfied_pc_indices else "Unsatisfied"
                 out_f.write(
-                    f"Path constraint\t{pc['index']}\t{pc['constraint_string']}"
-                    f"\tSupport={pc['support']}\tN/A\n"
+                    f"Path constraint {pc['index']}\t{pc['constraint_string']}"
+                    f"\tSupport={pc['support']}\t{status}\n"
                 )
 
-        # Section header for cycles/paths
         out_f.write("List of extracted cycles/paths\n")
 
-        # --- Write all cycles ---
+        def walk_line(kind, number, walk):
+            line = (f"{kind}={number};"
+                    f"Copy_count={walk['CopyNumber']:.8f};"
+                    f"Segments={','.join(walk['Segments'])}")
+            if path_constraints:
+                matched = walk.get("Matched_Index_Set", set())
+                line += ";Path_constraints_satisfied=" + ",".join(
+                    str(i) for i in stable_iter(sorted(matched)))
+            return line + "\n"
+
         for cycle in stable_iter(all_cycles_ordered):
-            seg_str = ",".join(cycle["Segments"])
-            matched_index_set = cycle.get("Matched_Index_Set", set())
-            path_str = ",".join(str(i) for i in stable_iter(sorted(matched_index_set)))
+            out_f.write(walk_line("Cycle", cycle["New_Order_Of_Cycle_Number"], cycle))
 
-            out_f.write(
-                f"Cycle={cycle['New_Order_Of_Cycle_Number']};"
-                f"Copy_count={cycle['CopyNumber']:.8f};"
-                f"Segments={seg_str};"
-                f"Path_constraints_satisfied={path_str}\n"
-            )
-
-        # --- Write all paths ---
         for path in stable_iter(all_paths_ordered):
-            seg_str = ",".join(path["Segments"])
-            matched_index_set = path.get("Matched_Index_Set", set())
-            path_str = ",".join(str(i) for i in stable_iter(sorted(matched_index_set)))
-
-            out_f.write(
-                f"Path={path['New_Order_Of_Path_Number']};"
-                f"Copy_count={path['CopyNumber']:.8f};"
-                f"Segments={seg_str};"
-                f"Path_constraints_satisfied={path_str}\n"
-            )
+            out_f.write(walk_line("Path", path["New_Order_Of_Path_Number"], path))
 
 
 def export_cycles_to_fasta(cycles_file, reference_file, fasta_output, converter_script):
@@ -3235,14 +3271,50 @@ def positive_int(value):
     return parsed_value
 
 
+def nonnegative_float(value):
+    """Argparse type for a finite float >= 0 (used for --gamma and --f-lower-bound).
+
+    float() accepts "nan" and "inf", and either would silently corrupt the
+    objective or the F constraint, so both are rejected here.
+    """
+    try:
+        parsed_value = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed_value):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    if parsed_value < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed_value
+
+
+MAX_SEED = 2_000_000_000  # Upper bound accepted for the solver/Python/NumPy seed.
+
+
+def seed_int(value):
+    """Argparse type for --seed: an integer in [0, MAX_SEED].
+
+    Validated here rather than with choices=range(...): argparse expands
+    `choices` into a string when printing --help or an error, which for a
+    range of 2 billion integers exhausts memory.
+    """
+    try:
+        parsed_value = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 0 <= parsed_value <= MAX_SEED:
+        raise argparse.ArgumentTypeError(f"must be between 0 and {MAX_SEED}")
+    return parsed_value
+
+
 parser = argparse.ArgumentParser(description="Run Cycle Extractor ILP Solver.")
 parser.add_argument("--graph", required=True, help="Path to input graph file.")
 parser.add_argument("--output", required=True, help="Path to output cycles file.")
 parser.add_argument("--log_file", help="Optional, path to log file.")
 parser.add_argument("--solver", choices=["gurobi", "highs"], default="gurobi",
                     help="Optimization backend (default: gurobi).")
-parser.add_argument("--seed", type=int, choices=range(0, 2000000001), default=0,
-                    metavar="N", help="Python/NumPy/Gurobi random seed, 0..2000000000 (default: 0).")
+parser.add_argument("--seed", type=seed_int, default=0, metavar="N",
+                    help=f"Python/NumPy/Gurobi random seed, 0..{MAX_SEED} (default: 0).")
 parser.add_argument(
     "--time-limit-seconds",
     type=positive_int,
@@ -3250,7 +3322,7 @@ parser.add_argument(
     help="Time limit for each cycle/path optimization in seconds (default: 7200 = 2 hours).",
 )
 parser.add_argument("--enforce-connectivity",action="store_true",help="Enable connectivity-enforced ILP (default = off)")
-parser.add_argument("--gamma",type=float,default=0.01,help="Gamma value (default = 0.01)")
+parser.add_argument("--gamma",type=nonnegative_float,default=0.01,help="Gamma value, >= 0 (default = 0.01)")
 parser.add_argument(
     "--max-multiplicity",
     type=positive_int,
@@ -3262,10 +3334,10 @@ parser.add_argument(
 )
 parser.add_argument(
     "--f-lower-bound",
-    type=float,
+    type=nonnegative_float,
     default=None,
     help=(
-        "Optional lower bound for the model variable F. When omitted, no "
+        "Optional lower bound (>= 0) for the model variable F. When omitted, no "
         "user-defined lower-bound constraint is added."
     ),
 )
@@ -3315,6 +3387,22 @@ if bool(args.fasta_output) != bool(args.ref):
 # Resolve paths
 # -----------------------------------------
 graph_file_path = Path(args.graph).resolve()
+# Check the graph file up front so a bad path gives a one-line error rather
+# than a traceback from deep inside graph construction.
+if not graph_file_path.exists():
+    parser.error(f"--graph: no such file: {args.graph}")
+if not graph_file_path.is_file():
+    parser.error(f"--graph: not a regular file: {args.graph}")
+try:
+    with open(graph_file_path) as graph_handle:
+        graph_has_sequence_edges = any(line.startswith("sequence") for line in graph_handle)
+except (OSError, UnicodeDecodeError) as exc:
+    parser.error(f"--graph: cannot read {args.graph}: {exc}")
+if not graph_has_sequence_edges:
+    parser.error(
+        f"--graph: {args.graph} has no 'sequence' lines; expected an "
+        "AmpliconArchitect or CoRAL breakpoint graph (*_graph.txt)."
+    )
 #cycles_file_path = Path(args.output).resolve()
 #output_dir = cycles_file_path.parent   # directory containing the graph
 output_file = Path(args.output).resolve()
@@ -3352,10 +3440,11 @@ amplicon_name = amplicon_file_name.replace("_graph.txt", "")  # e.g., "amplicon1
 # match = re.search(r"amplicon(\d+)", amplicon_name.lower())
 # amplicon_num = match.group(1) # e.g., "1"
 
-if ENFORCE_CONNECTIVITY:
-    log_file = output_dir / "ILP_Connectivity_log.txt"
-else:
-    log_file = output_dir / "ILP_log.txt"
+# Name the log after the output file so several runs writing to one directory
+# (e.g. one per amplicon) do not overwrite each other's logs:
+# X_cycles.txt -> X_cycles_ILP_log.txt (or X_cycles_ILP_Connectivity_log.txt).
+log_suffix = "_ILP_Connectivity_log.txt" if ENFORCE_CONNECTIVITY else "_ILP_log.txt"
+log_file = output_dir / (output_file.stem + log_suffix)
 if args.log_file:
     log_file = args.log_file
 
