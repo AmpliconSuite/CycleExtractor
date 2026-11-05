@@ -6,6 +6,11 @@ try:
     import highspy
 except ImportError:
     highspy = None
+try:
+    import mosek
+except ImportError as exc:
+    mosek = None
+    mosek_import_error = str(exc)
 Model, GRB = GurobiModel, GurobiGRB
 import math
 import re
@@ -25,7 +30,7 @@ import argparse
 import subprocess
 from pathlib import Path
 ##############################
-class HighsGRB:
+class SolverConstants:
     """Small constant set used by the solver-neutral model formulations."""
 
     OPTIMAL = "optimal"
@@ -36,26 +41,26 @@ class HighsGRB:
     MAXIMIZE = "maximize"
 
 
-class HighsLinearConstraint:
+class LinearConstraint:
     def __init__(self, expression, sense):
         self.expression = expression
         self.sense = sense
 
 
-class HighsLinearExpression:
+class LinearExpression:
     def __init__(self, terms=None, constant=0.0):
         self.terms = dict(terms or {})
         self.constant = float(constant)
 
     @staticmethod
     def coerce(value):
-        if isinstance(value, HighsLinearExpression):
+        if isinstance(value, LinearExpression):
             return value
-        if isinstance(value, HighsVariable):
-            return HighsLinearExpression({value: 1.0})
+        if isinstance(value, LinearVariable):
+            return LinearExpression({value: 1.0})
         if isinstance(value, (int, float, np.number)):
-            return HighsLinearExpression(constant=float(value))
-        raise TypeError(f"Unsupported value in HiGHS linear expression: {type(value)!r}")
+            return LinearExpression(constant=float(value))
+        raise TypeError(f"Unsupported value in linear expression: {type(value)!r}")
 
     def _combine(self, other, factor):
         other = self.coerce(other)
@@ -64,7 +69,7 @@ class HighsLinearExpression:
             terms[variable] = terms.get(variable, 0.0) + factor * coefficient
             if abs(terms[variable]) < 1e-15:
                 del terms[variable]
-        return HighsLinearExpression(terms, self.constant + factor * other.constant)
+        return LinearExpression(terms, self.constant + factor * other.constant)
 
     def __add__(self, other):
         return self._combine(other, 1.0)
@@ -81,7 +86,7 @@ class HighsLinearExpression:
     def __mul__(self, scalar):
         if not isinstance(scalar, (int, float, np.number)):
             return NotImplemented
-        return HighsLinearExpression(
+        return LinearExpression(
             {variable: float(scalar) * coefficient for variable, coefficient in self.terms.items()},
             float(scalar) * self.constant,
         )
@@ -93,16 +98,16 @@ class HighsLinearExpression:
         return self * -1.0
 
     def __le__(self, other):
-        return HighsLinearConstraint(self - other, "<=")
+        return LinearConstraint(self - other, "<=")
 
     def __ge__(self, other):
-        return HighsLinearConstraint(self - other, ">=")
+        return LinearConstraint(self - other, ">=")
 
     def __eq__(self, other):
-        return HighsLinearConstraint(self - other, "==")
+        return LinearConstraint(self - other, "==")
 
 
-class HighsVariable:
+class LinearVariable:
     __hash__ = object.__hash__
 
     def __init__(self, model, index, name):
@@ -112,7 +117,7 @@ class HighsVariable:
         self.X = 0.0
 
     def _expression(self):
-        return HighsLinearExpression({self: 1.0})
+        return LinearExpression({self: 1.0})
 
     def __add__(self, other):
         return self._expression() + other
@@ -162,15 +167,15 @@ class HighsModel:
         self.Status = None
         self.SolCount = 0
 
-    def addVar(self, name, vtype=HighsGRB.CONTINUOUS, lb=0.0, ub=None):
+    def addVar(self, name, vtype=SolverConstants.CONTINUOUS, lb=0.0, ub=None):
         index = len(self._variables)
         upper = highspy.kHighsInf if ub is None else float(ub)
-        if vtype == HighsGRB.BINARY:
+        if vtype == SolverConstants.BINARY:
             upper = min(upper, 1.0)
         self._highs.addVar(float(lb), upper)
-        if vtype in (HighsGRB.BINARY, HighsGRB.INTEGER):
+        if vtype in (SolverConstants.BINARY, SolverConstants.INTEGER):
             self._highs.changeColIntegrality(index, highspy.HighsVarType.kInteger)
-        variable = HighsVariable(self, index, name)
+        variable = LinearVariable(self, index, name)
         self._variables.append(variable)
         try:
             self._highs.passColName(index, name)
@@ -178,7 +183,7 @@ class HighsModel:
             pass
         return variable
 
-    def addVars(self, keys, vtype=HighsGRB.CONTINUOUS, lb=0.0, ub=None, name="var"):
+    def addVars(self, keys, vtype=SolverConstants.CONTINUOUS, lb=0.0, ub=None, name="var"):
         keys = range(keys) if isinstance(keys, int) else list(keys)
         return {
             key: self.addVar(
@@ -191,16 +196,16 @@ class HighsModel:
         }
 
     def setObjective(self, expression, sense):
-        expression = HighsLinearExpression.coerce(expression)
+        expression = LinearExpression.coerce(expression)
         for variable, coefficient in expression.terms.items():
             self._highs.changeColCost(variable.index, float(coefficient))
-        if sense == HighsGRB.MAXIMIZE:
+        if sense == SolverConstants.MAXIMIZE:
             self._highs.setMaximize()
         else:
             self._highs.setMinimize()
 
     def addConstr(self, constraint, name=None):
-        if not isinstance(constraint, HighsLinearConstraint):
+        if not isinstance(constraint, LinearConstraint):
             raise TypeError(f"Expected a linear constraint, received {type(constraint)!r}")
         expression = constraint.expression
         indices = np.array([v.index for v in expression.terms], dtype=np.int32)
@@ -231,11 +236,13 @@ class HighsModel:
         # HiGHS 1.10 requires console logging enabled for logging callbacks.
         self._highs.setOptionValue("output_flag", True)
         self._highs.setOptionValue("log_to_console", True)
+        # Keep integer rounding from admitting material flow through big-M rows.
+        self._highs.setOptionValue("mip_feasibility_tolerance", 1e-9)
         self._highs.run()
         self._model_status = self._highs.getModelStatus()
         statuses = {
-            highspy.HighsModelStatus.kOptimal: HighsGRB.OPTIMAL,
-            highspy.HighsModelStatus.kTimeLimit: HighsGRB.TIME_LIMIT,
+            highspy.HighsModelStatus.kOptimal: SolverConstants.OPTIMAL,
+            highspy.HighsModelStatus.kTimeLimit: SolverConstants.TIME_LIMIT,
         }
         self.Status = statuses.get(self._model_status, str(self._model_status))
         self.status = self.Status
@@ -249,6 +256,119 @@ class HighsModel:
 
     def is_optimal(self):
         return self._model_status == highspy.HighsModelStatus.kOptimal
+
+
+class MosekModel:
+    """MOSEK 10+ MILP adapter, reusing the lightweight linear expressions above."""
+
+    def __init__(self, name):
+        if mosek is None:
+            raise RuntimeError(
+                "The MOSEK backend requires mosek>=10. Install with: pip install 'mosek>=10'. "
+                f"Import failed: {mosek_import_error}"
+            )
+        if mosek.Env.getversion()[0] < 10:
+            raise RuntimeError("The MOSEK backend requires MOSEK 10 or newer.")
+        self.name = name
+        self._task = mosek.Task()
+        # CE reconstructs integer traversals from flow/F. Tight tolerances limit
+        # leakage through big-M constraints before that reconstruction.
+        self._task.putdouparam(mosek.dparam.mio_tol_abs_relax_int, 1e-9)
+        self._task.putdouparam(mosek.dparam.mio_tol_feas, 1e-9)
+        self._variables = []
+        self.status = self.Status = None
+        self.SolCount = 0
+
+    def addVar(self, name, vtype=SolverConstants.CONTINUOUS, lb=0.0, ub=None):
+        index = len(self._variables)
+        if vtype == SolverConstants.BINARY:
+            ub = 1.0 if ub is None else min(float(ub), 1.0)
+        self._task.appendvars(1)
+        bound = mosek.boundkey.lo if ub is None else (
+            mosek.boundkey.fx if lb == ub else mosek.boundkey.ra
+        )
+        self._task.putvarbound(index, bound, float(lb), 0.0 if ub is None else float(ub))
+        if vtype in (SolverConstants.BINARY, SolverConstants.INTEGER):
+            self._task.putvartype(index, mosek.variabletype.type_int)
+        self._task.putvarname(index, name)
+        variable = LinearVariable(self, index, name)
+        self._variables.append(variable)
+        return variable
+
+    def addVars(self, keys, vtype=SolverConstants.CONTINUOUS, lb=0.0, ub=None, name="var"):
+        keys = range(keys) if isinstance(keys, int) else list(keys)
+        return {
+            key: self.addVar(name=f"{name}[{key}]", vtype=vtype, lb=lb, ub=ub)
+            for key in keys
+        }
+
+    def setObjective(self, expression, sense):
+        expression = LinearExpression.coerce(expression)
+        self._task.putclist(
+            list(range(len(self._variables))),
+            [expression.terms.get(variable, 0.0) for variable in self._variables],
+        )
+        self._task.putcfix(expression.constant)
+        self._task.putobjsense(
+            mosek.objsense.maximize if sense == SolverConstants.MAXIMIZE else mosek.objsense.minimize
+        )
+
+    def addConstr(self, constraint, name=None):
+        if not isinstance(constraint, LinearConstraint):
+            raise TypeError(f"Expected a linear constraint, received {type(constraint)!r}")
+        expression = constraint.expression
+        index = self._task.getnumcon()
+        self._task.appendcons(1)
+        self._task.putarow(
+            index, [v.index for v in expression.terms], list(expression.terms.values())
+        )
+        bound = {"<=": mosek.boundkey.up, ">=": mosek.boundkey.lo, "==": mosek.boundkey.fx}
+        rhs = -expression.constant
+        self._task.putconbound(index, bound[constraint.sense], rhs, rhs)
+        if name is not None:
+            self._task.putconname(index, name)
+
+    def setParam(self, name, value):
+        name = name.lower()
+        if name in ("timelimit", "time_limit"):
+            self._task.putdouparam(mosek.dparam.optimizer_max_time, float(value))
+        elif name == "seed":
+            self._task.putintparam(mosek.iparam.mio_seed, int(value))
+        elif name == "threads":
+            self._task.putintparam(mosek.iparam.num_threads, int(value))
+        else:
+            raise ValueError(f"Unsupported MOSEK parameter: {name}")
+
+    def optimize(self):
+        self.status = self.Status = None
+        self.SolCount = 0
+        self._task.set_Stream(mosek.streamtype.log, lambda message: print(message, end=""))
+        termination = self._task.optimize()
+        # Read the integer incumbent, never the relaxation. A degenerate graph
+        # can produce a model with no integer variables, which is an LP instead.
+        solution_type = mosek.soltype.itg
+        if self._task.getnumintvar() == 0:
+            solution_type = (mosek.soltype.bas if self._task.solutiondef(mosek.soltype.bas)
+                             else mosek.soltype.itr)
+        solution_status = (self._task.getsolsta(solution_type)
+                           if self._task.solutiondef(solution_type) else mosek.solsta.unknown)
+        if solution_status in (mosek.solsta.integer_optimal, mosek.solsta.optimal):
+            self.Status = SolverConstants.OPTIMAL
+        elif termination == mosek.rescode.trm_max_time:
+            self.Status = SolverConstants.TIME_LIMIT
+        else:
+            self.Status = f"{solution_status} ({termination})"
+        self.status = self.Status
+        self.SolCount = int(solution_status in (
+            mosek.solsta.integer_optimal, mosek.solsta.optimal, mosek.solsta.prim_feas
+        ))
+        if self.SolCount:
+            for variable, value in zip(self._variables, self._task.getxx(solution_type)):
+                variable.X = float(value)
+            self.ObjVal = self._task.getprimalobj(solution_type)
+
+    def is_optimal(self):
+        return self.Status == SolverConstants.OPTIMAL
 
 
 
@@ -886,6 +1006,16 @@ def compute_Length_weighted_copy_number_graph(capacity_sequence_edges,length_seq
     )
     return weight
 ########## Calculate Length weighted copy number of the graph. Here we do not consider segments with CN<5. (CN of the graph)
+def copy_number_upper_bound(*capacity_maps):
+    """Bound F for any nonempty solution by the largest residual edge capacity.
+
+    Every selected breakpoint edge has flow >= F and flow <= its capacity.
+    Bounding the otherwise irrelevant F of an empty solution loses no walk.
+    """
+    return max([0.0] + [float(value) for capacities in capacity_maps
+                        for value in capacities.values()])
+
+
 ######### Build the model
 def build_cycle_model(
                 G,
@@ -916,7 +1046,9 @@ def build_cycle_model(
     f_concordant_edge = model.addVars(stable_iter(concordant_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_concordant_edge")
     f_discordant_edge = model.addVars(stable_iter(discordant_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_discordant_edge")
     f_sequence_edge = model.addVars(stable_iter(sequence_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_sequence_edge")    
-    F = model.addVar(name="f_min", lb=0, vtype=GRB.CONTINUOUS)  
+    f_upper = copy_number_upper_bound(
+        capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges)
+    F = model.addVar(name="f_min", lb=0, ub=f_upper, vtype=GRB.CONTINUOUS)
     if f_lower_bound is not None:
         model.addConstr(F >= f_lower_bound, name="F_UserLowerBound")
     P = model.addVars(stable_iter(len(path_constraints)), vtype=GRB.BINARY, name="P_path_constraint")
@@ -991,7 +1123,7 @@ def build_cycle_model(
             flow_in_sequence == flow_out_concordant + flow_out_discordant,
             name=f"FlowConservation2_{k}")
     ### Constraint 7 #Big-M constant (ensure it's large enough)    
-    M = 1000000    
+    M = f_upper  # Valid for every nonempty solution; avoids a fixed million-scale M.
     for edge in stable_iter(concordant_edges):
         i, j = edge
         edge_key = tuple(sorted((i, j)))
@@ -1015,7 +1147,9 @@ def build_cycle_model(
             z = z_discordant[edge_key + (m,)]
             y = y_discordant[edge_key + (m,)]
             model.addConstr(z <= F, name=f"z_leq_fmin_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
-            model.addConstr(z <= M * y, name=f"z_leq_My_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
+            # Since m*z contributes to this edge's flow, its capacity also bounds z.
+            z_upper = min(f_upper, max(0.0, capacity_discordant_edges[edge_key]) / m)
+            model.addConstr(z <= z_upper * y, name=f"z_leq_My_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z >= F - M * (1 - y), name=f"z_geq_fmin_minus_M_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z >= 0, name=f"z_geq_0_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
     for i, j in stable_iter(discordant_edges):
@@ -1634,6 +1768,28 @@ def test_merged_closed_walk(walk, sequence_edges, f_sequence_edge, discordant_ed
     else:
        return False
 
+def reconstruction_flow_error(walks, copy_number, flow_maps, capacity_maps):
+    """Check actual traversal counts across all components before accepting them.
+
+    Checking rounded multiplicities alone is insufficient: a near-integer binary
+    value can permit flow/F far from an integer through a big-M constraint.
+    """
+    counts = Counter((kind, tuple(sorted(edge)))
+                     for walk in walks for kind, edge in walk if kind in flow_maps)
+    for (kind, edge), count in sorted(counts.items()):
+        required = count * copy_number
+        flow = flow_maps[kind][edge]
+        capacity = capacity_maps[kind][edge]
+        # Allow the default absolute row feasibility tolerance of the backends,
+        # plus a small relative term for large copy numbers.
+        tolerance = 1e-6 + 1e-9 * max(abs(required), abs(flow), abs(capacity))
+        if required > min(flow, capacity) + tolerance:
+            return (f"{kind} {edge}: {count} traversals at CN={copy_number:.12g} "
+                    f"require {required:.12g}, solver flow={flow:.12g}, "
+                    f"residual capacity={capacity:.12g}")
+    return None
+
+
 ########## In case od two disconnected cycles, we might be able to increase the CN of one of them
 def increase_component_copy_number(walk, base_F, capacity_sequence_edges,
                                    capacity_concordant_edges, capacity_discordant_edges,
@@ -1690,15 +1846,25 @@ def increase_component_copy_number(walk, base_F, capacity_sequence_edges,
                   f"increase={increase:.8f}; capacity={capacities[kind][edge]:.8f}")
     return base_F + delta, delta
 ########## parsing function
+def is_auxiliary_sequence_edge(node1, node2):
+    """Recognize CE's source/sink and foldback-expansion edges."""
+    if node1 in ("s", "t") or node2 in ("s", "t"):
+        return True
+    # Create_graph expands each foldback using (1, 2), (3, 4), ... as
+    # coordinate-free node IDs. A genomic endpoint always contains a colon.
+    if node1.isdecimal() and node2.isdecimal():
+        low, high = sorted((int(node1), int(node2)))
+        return low % 2 == 1 and high == low + 1
+    return False
+
+
 def parse_node_colon_format(node_str):
-    
-     # Parse a node name like 'chr15:98778369-' into ('chr15', 98778369)
-    
-    match = re.match(r"(chr[\w\d]+):(\d+)[+-]", node_str)
+    """Parse a genomic endpoint without changing the reference's contig name."""
+    # AA references may use 2, chr2, MT, or accession/scaffold names. The colon
+    # and terminal strand delimit the coordinates; 'chr' is not part of the grammar.
+    match = re.fullmatch(r"([^:\s]+):([0-9]+)[+-]", node_str)
     if match:
-        chrom = match.group(1)
-        pos = int(match.group(2))
-        return chrom, int(pos)
+        return match.group(1), int(match.group(2))
     return None, None
 ############# convert closed walk to segment string
 def convert_walk_to_segment_string(walk, segments, copy_count):
@@ -1710,6 +1876,8 @@ def convert_walk_to_segment_string(walk, segments, copy_count):
             continue
 
         node1, node2 = entry[1]
+        if is_auxiliary_sequence_edge(node1, node2):
+            continue  # Auxiliary edges have no genomic segment identifier.
 
         if i == 0 or i + 1 >= len(walk):
             continue
@@ -1722,8 +1890,8 @@ def convert_walk_to_segment_string(walk, segments, copy_count):
         chrom1, pos1 = parse_node_colon_format(node1)
         chrom2, pos2 = parse_node_colon_format(node2)
 
-        if chrom1 != chrom2:
-            continue
+        if chrom1 is None or chrom2 is None or chrom1 != chrom2:
+            raise ValueError(f"Invalid genomic sequence edge in reconstructed walk: {node1!r}, {node2!r}")
 
         #for seg_id, (seg_chrom, seg_start, seg_end) in segments.items():
         for seg_id, seg_info in stable_iter(segments.items()):
@@ -1744,6 +1912,8 @@ def convert_walk_to_segment_string(walk, segments, copy_count):
                 elif from_strand == '-' and to_strand == '+':
                     segment_path.append(f"{seg_id}+")
                 break
+        else:
+            raise ValueError(f"No input segment matches reconstructed sequence edge: {node1!r}, {node2!r}")
 
     return f"Cycle={1};Copy_count={copy_count};Segments={','.join(segment_path)}"
 #### check if any of the path constraints are subsequents of walks
@@ -2509,7 +2679,9 @@ def build_path_model(
     f_concordant_edge = model.addVars(stable_iter(concordant_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_concordant_edge")
     f_discordant_edge = model.addVars(stable_iter(discordant_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_discordant_edge")
     f_sequence_edge = model.addVars(stable_iter(sequence_edges), vtype=GRB.CONTINUOUS, lb=0, name="f_sequence_edge")    
-    F = model.addVar(name="f_min", lb=0, vtype=GRB.CONTINUOUS)  
+    f_upper = copy_number_upper_bound(
+        capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges)
+    F = model.addVar(name="f_min", lb=0, ub=f_upper, vtype=GRB.CONTINUOUS)
     if f_lower_bound is not None:
         model.addConstr(F >= f_lower_bound, name="F_UserLowerBound")
     P = model.addVars(stable_iter(len(path_constraints)), vtype=GRB.BINARY, name="P_path_constraint")
@@ -2621,7 +2793,7 @@ def build_path_model(
             name="OneEdgeIntoT"
         )
     ### Constraint 7 #Big-M constant (ensure it's large enough)    
-    M = 1000000    
+    M = f_upper  # Valid for every nonempty solution; avoids a fixed million-scale M.
     for edge in stable_iter(concordant_edges):
         i, j = edge
         edge_key = tuple(sorted((i, j)))
@@ -2645,7 +2817,9 @@ def build_path_model(
             z = z_discordant[edge_key + (m,)]
             y = y_discordant[edge_key + (m,)]
             model.addConstr(z <= F, name=f"z_leq_fmin_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
-            model.addConstr(z <= M * y, name=f"z_leq_My_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
+            # Since m*z contributes to this edge's flow, its capacity also bounds z.
+            z_upper = min(f_upper, max(0.0, capacity_discordant_edges[edge_key]) / m)
+            model.addConstr(z <= z_upper * y, name=f"z_leq_My_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z >= F - M * (1 - y), name=f"z_geq_fmin_minus_M_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
             model.addConstr(z >= 0, name=f"z_geq_0_discordant_{edge_key[0]}_{edge_key[1]}_{m}")
     for i, j in stable_iter(discordant_edges):
@@ -2957,6 +3131,8 @@ def convert_s_t_walk_to_segment_string(walk, segments, copy_count):
             continue
 
         node1, node2 = entry[1]
+        if is_auxiliary_sequence_edge(node1, node2):
+            continue  # Auxiliary edges have no genomic segment identifier.
 
         if i == 0 or i + 1 >= len(walk):
             continue
@@ -2969,8 +3145,8 @@ def convert_s_t_walk_to_segment_string(walk, segments, copy_count):
         chrom1, pos1 = parse_node_colon_format(node1)
         chrom2, pos2 = parse_node_colon_format(node2)
 
-        if chrom1 != chrom2:
-            continue
+        if chrom1 is None or chrom2 is None or chrom1 != chrom2:
+            raise ValueError(f"Invalid genomic sequence edge in reconstructed walk: {node1!r}, {node2!r}")
 
         #for seg_id, (seg_chrom, seg_start, seg_end) in segments.items():
         for seg_id, seg_info in stable_iter(segments.items()):
@@ -2991,6 +3167,8 @@ def convert_s_t_walk_to_segment_string(walk, segments, copy_count):
                 elif from_strand == '-' and to_strand == '+':
                     segment_path.append(f"{seg_id}+")
                 break
+        else:
+            raise ValueError(f"No input segment matches reconstructed sequence edge: {node1!r}, {node2!r}")
     # add 0+ at the beginning and 0- at the end
     segment_path = ["0+"] + segment_path + ["0-"]
     
@@ -3311,10 +3489,10 @@ parser = argparse.ArgumentParser(description="Run Cycle Extractor ILP Solver.")
 parser.add_argument("--graph", required=True, help="Path to input graph file.")
 parser.add_argument("--output", required=True, help="Path to output cycles file.")
 parser.add_argument("--log_file", help="Optional, path to log file.")
-parser.add_argument("--solver", choices=["gurobi", "highs"], default="gurobi",
+parser.add_argument("--solver", choices=["gurobi", "highs", "mosek"], default="gurobi",
                     help="Optimization backend (default: gurobi).")
 parser.add_argument("--seed", type=seed_int, default=0, metavar="N",
-                    help=f"Python/NumPy/Gurobi random seed, 0..{MAX_SEED} (default: 0).")
+                    help=f"Python/NumPy/solver random seed, 0..{MAX_SEED} (default: 0).")
 parser.add_argument(
     "--time-limit-seconds",
     type=positive_int,
@@ -3368,10 +3546,19 @@ if args.solver == "gurobi":
     if GurobiModel is None:
         parser.error("Gurobi requires gurobipy. Install it or select --solver highs.")
     Model, GRB = GurobiModel, GurobiGRB
-else:
+elif args.solver == "highs":
     if highspy is None:
         parser.error("HiGHS requires highspy. Install it with: pip install highspy")
-    Model, GRB = HighsModel, HighsGRB
+    Model, GRB = HighsModel, SolverConstants
+else:
+    if mosek is None:
+        parser.error(
+            "MOSEK requires mosek>=10. Install it with: pip install 'mosek>=10'. "
+            f"Import failed: {mosek_import_error}"
+        )
+    if mosek.Env.getversion()[0] < 10:
+        parser.error("The MOSEK backend requires MOSEK 10 or newer.")
+    Model, GRB = MosekModel, SolverConstants
 print(f"MILP solver: {args.solver}")
 RANDOM_SEED = args.seed
 random.seed(RANDOM_SEED)
@@ -3483,6 +3670,8 @@ sys.stdout = Logger(log_file)
 print(f"CE version: {__version__}")
 if args.solver == "highs":
     print(f"HiGHS version: {highspy.Highs().version()}")
+elif args.solver == "mosek":
+    print(f"MOSEK version: {'.'.join(map(str, mosek.Env.getversion()))}")
 print(f"Gamma value set to: {gamma}")
 print(f"Using graph file: {graph_file_path}")
 print(f"Test/output directory: {output_file}")
@@ -3531,6 +3720,8 @@ Num_cycles=0
 All_Cycles = []
 All_Paths = []
 Disconnected_Solutions = []
+# Output metadata must exist even when neither optimizer yields a usable walk.
+segments, Path_Constraints = parse_graph_file(graph_file_path)
 print("Start cycle extraction")
 while True: #while Iteration==1:
     ###################################################
@@ -3600,6 +3791,13 @@ while True: #while Iteration==1:
         f_discordant_edge_val, X_discordant_edge_val)
 
     
+    # Auxiliary s/t edges can carry flow in a zero-objective optimum.
+    # Such a solution has no genomic traversal to reconstruct, even if F > 0.
+    if not any(flow > 1e-8 for edge, flow in f_sequence_edge_val.items()
+               if 's' not in edge and 't' not in edge):
+        print("Stopping cycle extraction: no positive genomic sequence flow.")
+        Num_cycles = Cycle_Or_Path_Number - 1
+        break
     if (
         total_solution_weight > 0.9 * weight_graph
         or F_val < 0.5
@@ -3632,6 +3830,16 @@ while True: #while Iteration==1:
     Final_closed_walk_test = best_cycle_candidate["walk_test"]
     test_message = best_cycle_candidate["test_message"]
     Final_closed_walk_completion_test = best_cycle_candidate["completion_test"]
+    reconstruction_error = reconstruction_flow_error(
+        [Final_closed_walk] + not_merged_walks, base_F,
+        {"sequence edge": f_sequence_edge_val, "concordant edge": f_concordant_edge_val,
+         "discordant edge": f_discordant_edge_val},
+        {"sequence edge": capacity_sequence_edges, "concordant edge": capacity_concordant_edges,
+         "discordant edge": capacity_discordant_edges})
+    if reconstruction_error:
+        print("Stopping cycle extraction: unsafe reconstruction: " + reconstruction_error)
+        Num_cycles = Cycle_Or_Path_Number - 1
+        break  # Retain earlier accepted results; do not subtract this candidate's flow.
     # Each component starts from this iteration's original solver CN.
     F_val = base_F
     delta_F = 0.0
@@ -3855,6 +4063,13 @@ while True: # while Iteration==1:
         f_discordant_edge_val, X_discordant_edge_val)
 
     
+    # Auxiliary s/t edges can carry flow in a zero-objective optimum.
+    # Such a solution has no genomic traversal to reconstruct, even if F > 0.
+    if not any(flow > 1e-8 for edge, flow in f_sequence_edge_val.items()
+               if 's' not in edge and 't' not in edge):
+        print("Stopping path extraction: no positive genomic sequence flow.")
+        Num_paths = Cycle_Or_Path_Number - Num_cycles - 1
+        break
     if (
         total_solution_weight > 0.9 * weight_graph
         or F_val < 0.5
@@ -3891,13 +4106,23 @@ while True: # while Iteration==1:
     Final_s_t_Walk = Final_s_t_Walk_segments
     matched_index_set = set(best_path_candidate["matched_constraints"])
     Final_s_t_walk_completion_test = best_path_candidate["completion_test"]
+    reconstruction_error = reconstruction_flow_error(
+        [merged_s_t_walk] + not_merged_closed_walks_to_s_t_path, base_F,
+        {"sequence edge": f_sequence_edge_val, "concordant edge": f_concordant_edge_val,
+         "discordant edge": f_discordant_edge_val},
+        {"sequence edge": capacity_sequence_edges, "concordant edge": capacity_concordant_edges,
+         "discordant edge": capacity_discordant_edges})
+    if reconstruction_error:
+        print("Stopping path extraction: unsafe reconstruction: " + reconstruction_error)
+        Num_paths = Cycle_Or_Path_Number - Num_cycles - 1
+        break  # Retain earlier accepted results; do not subtract this candidate's flow.
     # Each component starts from this iteration's original solver CN.
     F_val = base_F
     delta_F = 0.0
     start_time_to_update = time.time()
     if not Final_s_t_walk_completion_test:
         F_val, delta_F = increase_component_copy_number(
-            s_t_Walk[0], base_F,
+            merged_s_t_walk, base_F,
             capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges,
             f_sequence_edge_val, f_concordant_edge_val, f_discordant_edge_val,
                              log_context=f"Iteration {Iteration}, Path {Cycle_Or_Path_Number}")
@@ -3908,7 +4133,7 @@ while True: # while Iteration==1:
     Final_closed_walk_test=True
     Solution_Type="Path"
     # write_Messages_file(Solution_Type,Messages_file_path, Final_closed_walk_test, Final_s_t_walk_completion_test, error_in_closed_walks,max_random_search_heuristic_attempts,Cycle_Or_Path_Number)
-    weight_ILP_path =compute_Length_weighted_copy_number_solution(sequence_edges,f_sequence_edge_val,length_sequence_edges, s_t_Walk[0])                 
+    weight_ILP_path =compute_Length_weighted_copy_number_solution(sequence_edges,f_sequence_edge_val,length_sequence_edges, merged_s_t_walk)
     length_ILP_path = weight_ILP_path/F_val    
     weight_ratio_ILP_path.append(weight_ILP_path/weight_graph)
     total_solution_weight += weight_ILP_path
