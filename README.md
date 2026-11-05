@@ -7,10 +7,38 @@ If you use CE in your research, please cite:
   
 # Requirements
 - **Python >= 3.10**
-- **Gurobi Optimizer** — a free academic license is available [here](https://www.gurobi.com/). The ```gurobipy``` package is installed automatically when you install Gurobi.
-- **HiGHS (optional)** — an open-source MILP solver. To use HiGHS, install the Python interface:
+- **One MILP solver**, selected with `--solver`:
+  - **Gurobi (default)** — requires `gurobipy` and a valid license. A free academic license is available [here](https://www.gurobi.com/).
+  - **HiGHS** — an open-source solver, installed with `pip install highspy`.
+  - **MOSEK 10 or newer** — requires the Python package and a valid MOSEK license. Install from the official pip distribution (recommended):
 ```bash
-- pip install highspy
+python3 -m pip install 'mosek>=10'
+# Alternative for releases available on the conda channel:
+conda install -c mosek 'mosek>=10'
+```
+
+Run MOSEK with, for example:
+```bash
+python3 CE.py --graph GBM39EC_EGFR_graph.txt --output /tmp/ce-mosek/cycles.txt --solver mosek
+```
+Choose one installation method in the Python environment used to run CE.
+MOSEK 12 is currently a beta release and requires Python >= 3.11; to explicitly try it, install
+`python3 -m pip install 'mosek==12.0b1'`. Ordinary installation keeps the stable
+release. MOSEK 12's [release notes](https://docs.mosek.com/12.0/releasenotes/changes.html)
+deprecate the conda package, so prefer pip for new environments. The
+version constraint selects an available release >= 10; it does not pin version 10.
+The Python package includes the solver runtime, but a license is obtained separately.
+Configure it using MOSEK's standard license location (for example,
+`$HOME/mosek/mosek.lic` on Linux) or set `MOSEKLM_LICENSE_FILE` to the license path.
+All three backends solve the same MILP, including optional connectivity constraints.
+MOSEK uses one solver thread and the supplied `--seed`; different solvers or versions
+can choose different solutions when multiple optima exist. MOSEK 8 and 9 are not supported.
+CE uses capacity-derived big-M bounds for every backend and tightens HiGHS's MIP
+feasibility tolerance and MOSEK's integer/feasibility tolerances to `1e-9`.
+Before accepting a reconstruction, CE checks aggregate traversal flow across its
+components against both solver flow and residual edge capacity. If this check
+fails beyond numerical tolerance, that extraction stage stops and retains earlier
+accepted results.
 
 - Python packages:
   - numpy
@@ -44,6 +72,10 @@ CE takes the standard [AmpliconArchitect](https://github.com/AmpliconSuite/Ampli
 - `SequenceEdge:` - unbroken genomic segments, with predicted copy numbers, coverage, length, and read counts.
 - `BreakpointEdge:` - `concordant` edges (adjacent segments on the same chromosome) and `discordant` edges (novel breakpoint junctions), each with a predicted copy number.
 - `PathConstraint:` (optional, only from CoRAL output) - long-read derived subwalk constraints used to disambiguate cycle traversals.
+
+Contig names are preserved exactly as written in the graph: `2`, `chr2`, `MT`,
+and accession/scaffold names are supported. CE does not add or remove `chr`;
+`2` and `chr2` remain distinct identifiers.
 
 An example short read graph:
 ```
@@ -108,7 +140,8 @@ By default, cycles (and walks) are sorted by their copy numbers (see the `--sort
 ## When CE stops
 CE extracts one solution per iteration, cycles first and then s,t-walks (paths). Each iteration solves a MILP whose copy number is `F`, and the accepted solution's flow is subtracted from the graph before the next iteration.
 - Cycle extraction stops when `F < 0.5`, or when the results accepted so far explain more than 90% of the graph's length-weighted copy number (the sum over segments of copy number × length). The solution that triggers the stop is discarded. Path extraction then runs and stops under the same two rules.
-- If a MILP reaches `--time-limit-seconds`, CE keeps the best solution the solver found and ends that stage. A time-out during cycle extraction still lets path extraction run.
+- If a MILP reaches `--time-limit-seconds`, CE may retain its best feasible incumbent, subject to the same stopping rules and reconstruction checks, and ends that stage. If no feasible incumbent exists, that candidate is skipped. Previously accepted results are retained. A timeout during cycle extraction still lets path extraction run.
+- The cycles file is written at normal program completion, including after solver timeouts. If no result was accepted, it contains graph metadata without cycle/path records. A hard process kill, out-of-memory termination, or exception can prevent file creation; CE does not currently checkpoint the file after each iteration.
 - Without `--enforce-connectivity`, a solution can have several disconnected parts. Each part is reported as its own cycle or path, and its copy number is raised to use any capacity left on its own edges, so a reported `Copy_count` can be larger than that iteration's `F`.
 
 The file uses the [CoRAL](https://github.com/AmpliconSuite/CoRAL) cycles-file layout, an extension of the AmpliconArchitect format, so CoRAL's tools (e.g. `coral cycle2bed`) can read it. It starts with a `#CycleExtractor <version>` header line and `Interval` lines for the amplified regions. Each subwalk constraint is marked `Satisfied` if at least one reported cycle or path satisfies it, and `Unsatisfied` otherwise. When the graph has no subwalk constraints, the constraint section and the `Path_constraints_satisfied` field are omitted, as in CoRAL.
@@ -154,8 +187,8 @@ A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it i
 |`--fasta-output`|	Path to the output file where the fasta cycles file will be written.|	-
 |`--ref`|	Path to the hg38. Required only when --fasta-output is used.|	-
 |`--cycles-to-fasta-script`|	Path to the cycles_file_to_fasta.py Script from the ecSimulator project.|	~/ecSimulator/src/cycles_file_to_fasta.py
-|`--solver <highs\|gurobi>`|	Choose the optimization solver.|	gurobi
-|`--time-limit-seconds`|	Time limit, in seconds, for each cycle or path MILP. When it is reached, CE keeps the best solution found so far and ends that extraction stage.|	7200 (2 hours)
+|`--solver <highs\|gurobi\|mosek>`|	Choose the optimization solver (MOSEK requires version 10+).|	gurobi
+|`--time-limit-seconds`|	Time limit, in seconds, for each cycle or path MILP. When reached, CE ends that stage and may retain a feasible incumbent after reconstruction checks; earlier accepted results are preserved.|	7200 (2 hours)
 |`--max-multiplicity`|	Choose the upper bound for the multiplicity of discordant edges|	5
 |`--seed`|	Random seed for Python, NumPy and the solver, 0..2000000000. Runs with the same seed give identical output.|	0
 |`--f-lower-bound`|	Optional lower bound (≥ 0) on the MILP copy number `F` of each cycle or path.|	none (no bound)
@@ -165,3 +198,14 @@ A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it i
 
 We understand that the user may start from the bam files which is not th input of CE. In that case if the user has long read data, they should follow the steps of CoRAL to get the breakpoint graph https://github.com/AmpliconSuite/CoRAL and if they have short read data, they should follow the Amplicon Architech https://github.com/virajbdeshpande/AmpliconArchitect .
 
+
+## Adding a solver backend
+
+`LinearVariable`, `LinearExpression`, `LinearConstraint`, and `SolverConstants`
+are shared adapter utilities; they have no dependency on HiGHS or MOSEK.
+An adapter implements `addVar`, `addVars`, `addConstr`, `setObjective`, `setParam`,
+and `optimize`. It supplies `Status`, `SolCount`, and variable `.X` values, exposing
+only a valid solution (the integer incumbent for a MILP). Register its CLI choice
+and its `(Model, GRB)` pair in backend selection. The formulation and reconstruction
+checks remain shared. Verify optimal, infeasible, and time-limited models both with
+and without an incumbent; never substitute an LP relaxation for a MILP solution.
