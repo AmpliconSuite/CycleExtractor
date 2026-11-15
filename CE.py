@@ -7,6 +7,7 @@ try:
 except ImportError:
     highspy = None
 Model, GRB = GurobiModel, GurobiGRB
+import logging
 import math
 import re
 import networkx as nx
@@ -250,6 +251,13 @@ class HighsModel:
     def is_optimal(self):
         return self._model_status == highspy.HighsModelStatus.kOptimal
 
+
+
+# Diagnostics from the walk decomposition heuristic (candidate walks, merges,
+# ranks). They are logged at DEBUG level, which --debug turns on; on graphs with
+# dozens of sequence edges they reach hundreds of MB per run, so they are off by
+# default. The handler is attached once stdout has been redirected to the log.
+logger = logging.getLogger("CycleExtractor")
 
 
 def stable_iter(values):
@@ -1270,10 +1278,66 @@ def is_edge_type_alternating(walk):
     
     return True
 ######### Before merging, rotate the walk if it is necessary
+def walk_issues(walk, circular=False):
+    """Check walk structure, endpoint continuity and edge alternation."""
+    issues = []
+    if len(walk) < 3 or len(walk) % 2 == 0:
+        issues.append("expected an odd-length node/edge list")
+    edge_types = []
+    for index, (label, value) in enumerate(walk):
+        if index % 2 == 0:
+            if label != "node":
+                issues.append((index, "expected node", label, value))
+            continue
+        if label not in {"sequence edge", "discordant edge", "concordant edge"}:
+            issues.append((index, "expected typed edge", label, value))
+            continue
+        edge_types.append(label == "sequence edge")
+        if index + 1 < len(walk):
+            left, right = walk[index - 1], walk[index + 1]
+            if left[0] != "node" or right[0] != "node" or sorted(value) != sorted((left[1], right[1])):
+                issues.append((index, "edge does not join adjacent nodes", left, value, right))
+    if not is_edge_type_alternating(walk):
+        issues.append("edge labels do not alternate")
+    if circular and walk:
+        if walk[0] != walk[-1]:
+            issues.append("cycle endpoints differ")
+        if edge_types and edge_types[0] == edge_types[-1]:
+            issues.append("edge labels do not alternate across cycle closure")
+    return issues
+
+
+def debug_walk(stage, walk, circular=False):
+    """Log a walk and its structural issues (--debug only)."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    logger.debug("%s: walk=%r", stage, walk)
+    logger.debug("%s: structural_issues=%r", stage, walk_issues(walk, circular))
+
+
+def debug_solver_budget(F, sequence, discordant, concordant):
+    """Log each edge's solver flow and the traversal count it implies (--debug only)."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    for kind, flows in (("sequence", sequence), ("discordant", discordant),
+                        ("concordant", concordant)):
+        for edge, flow in sorted(flows.items()):
+            if flow != 0:
+                ratio = flow / F if F else None
+                logger.debug("solver budget: %s %r flow=%.17g F=%.17g ratio=%r count=%s",
+                             kind, edge, flow, F, ratio,
+                             round(ratio) if ratio is not None else None)
+
+
 def find_and_rotate_walk(walk1, walk2):
     
     # Try merging walk2 into walk1 at shared nodes,
     # testing both entry directions, and preserve edge-type alternation.
+
+    issues = walk_issues(walk2, circular=True)
+    if issues:
+        logger.debug("merge rejected: inserted walk is invalid: %r", issues)
+        return walk1
 
     nodes1 = {entry[1] for entry in stable_iter(walk1) if entry[0] == "node"}
     shared_indices = [(i, entry[1]) for i, entry in stable_iter(enumerate(walk2))
@@ -1311,7 +1375,11 @@ def find_and_rotate_walk(walk1, walk2):
             # print("First part of walk 1: ", walk1[:insert_index + 1])
             # print("walk 2 rotated: ", rotated)
             # print("Second part of walk 1: ", walk1[insert_index + 1:])
-            if is_edge_type_alternating(merged_candidate):
+            accepted = not walk_issues(merged_candidate, circular=walk1[0] == walk1[-1])
+            logger.debug("merge forward: shared=%r insert=%s rotate=%s accepted=%s",
+                         shared_node, insert_index, rotated_start, accepted)
+            debug_walk("merge forward candidate", merged_candidate)
+            if accepted:
                 return merged_candidate
             # --- Try reversed rotated walk ---
             # Keep closure at start/end, reverse middle
@@ -1330,7 +1398,11 @@ def find_and_rotate_walk(walk1, walk2):
 
             # print("reversed walk 2 rotated: ", reversed_rotated)
             merged_candidate_reversed = walk1[:insert_index + 1] + reversed_rotated + walk1[insert_index + 1:]
-            if is_edge_type_alternating(merged_candidate_reversed):
+            accepted = not walk_issues(merged_candidate_reversed, circular=walk1[0] == walk1[-1])
+            logger.debug("merge reverse: shared=%r insert=%s rotate=%s accepted=%s",
+                         shared_node, insert_index, rotated_start, accepted)
+            debug_walk("merge reverse candidate", merged_candidate_reversed)
+            if accepted:
                 return merged_candidate_reversed
 
     print("⚠️ Warning: No valid merge preserving alternation. Skipping merge.")
@@ -1498,14 +1570,14 @@ def create_closed_walks(sequence_edges, f_sequence_edge, discordant_edges, f_dis
                     current_node = next_node
                     edge_type = "non-sequence"
     
-                if current_node == ordered_closed_walk[0][1]:
+                if current_node == ordered_closed_walk[0][1] and edge_type == "sequence":
                     break
     
             all_closed_walks.append(ordered_closed_walk)
             
         # --- Evaluate correctness after each attempt ---
         all_walks_closed = all(
-            walk[0][1] == walk[-1][1]
+            not walk_issues(walk, circular=True)
             for walk in stable_iter(all_closed_walks)
         )
     
@@ -1552,50 +1624,9 @@ def merge_all_closed_walks(walks):
     return merged_walk, not_merged_walks
 
 def test_closed_walk(walk):
-    
-    # Validates a closed walk based on four rules:
-    # 1. Alternating edge types: sequence, then non-sequence, etc.
-    # 2. No two consecutive nodes.
-    # 3. No two consecutive edges.
-    # 4. Walk must start and end with the same node.
+    issues = walk_issues(walk, circular=True)
+    return (False, repr(issues)) if issues else (True, "Walk is valid.")
 
-    # Returns: (is_valid)
-
-    if not walk:
-        return False, "❌ Walk is empty."
-
-    if walk[0][0] != "node" or walk[-1][0] != "node":
-        return False, "❌ Walk must start and end with a node."
-
-    if walk[0][1] != walk[-1][1]:
-        return False, f"❌ Start and end node differ: {walk[0][1]} ≠ {walk[-1][1]}"
-
-    prev_type = None
-    prev_edge_type = None
-
-    for i, entry in stable_iter(enumerate(walk)):
-        entry_type, label = entry
-
-        # Rule 2 & 3: No two nodes or two edges in a row
-        if prev_type == entry_type:
-            if entry_type == "node":
-                
-                return False, f"❌ Two consecutive nodes at index {i-1} and {i}. The walk is {walk}"
-            else:
-                return False, f"❌ Two consecutive edges at index {i-1} and {i}."
-
-        if entry_type == "edge":
-            # Rule 1: Enforce alternating edge type
-            edge_type = label[0]  # 'e', 'c', or 'd'
-            if prev_edge_type is not None:
-                if (edge_type == "e" and prev_edge_type == "e") or \
-                   (edge_type in ("c", "d") and prev_edge_type in ("c", "d")):
-                    return False, f"❌ Edge alternation failed at index {i}: {prev_edge_type} → {edge_type}"
-            prev_edge_type = edge_type
-
-        prev_type = entry_type
-
-    return True, "✅ Walk is valid."
 ###### test if all closed walks are merged 
 ###### by testing if all edges of ILP are used in the merged final walk
 def test_merged_closed_walk(walk, sequence_edges, f_sequence_edge, discordant_edges, f_discordant_edge, 
@@ -1741,8 +1772,12 @@ def convert_walk_to_segment_string(walk, segments, copy_count):
 
                 if from_strand == '+' and to_strand == '-':
                     segment_path.append(f"{seg_id}-")
+                    logger.debug("cycle segment: walk_index=%s edge=%r neighbors=%r,%r token=%s-",
+                                 i, entry[1], prev_node, next_node, seg_id)
                 elif from_strand == '-' and to_strand == '+':
                     segment_path.append(f"{seg_id}+")
+                    logger.debug("cycle segment: walk_index=%s edge=%r neighbors=%r,%r token=%s+",
+                                 i, entry[1], prev_node, next_node, seg_id)
                 break
 
     return f"Cycle={1};Copy_count={copy_count};Segments={','.join(segment_path)}"
@@ -1816,15 +1851,25 @@ def select_best_closed_walk(
     best_candidate = None
     best_rank = None
 
-    for _ in range(candidate_runs):
+    debug_solver_budget(F, f_sequence_edge, f_discordant_edge, f_concordant_edge)
+    for candidate_index in range(1, candidate_runs + 1):
+        logger.debug("cycle candidate %s/%s", candidate_index, candidate_runs)
         all_closed_walks, construction_error = create_closed_walks(
             sequence_edges, f_sequence_edge,
             discordant_edges, f_discordant_edge,
             concordant_edges, f_concordant_edge,
             1, segments, F,
         )
+        for index, walk in enumerate(all_closed_walks):
+            debug_walk(f"cycle candidate {candidate_index} input {index}", walk)
         final_walk, not_merged_walks = merge_all_closed_walks(all_closed_walks)
         walk_is_closed, test_message = test_closed_walk(final_walk)
+        if construction_error or not walk_is_closed or any(
+            walk_issues(walk, circular=True) for walk in not_merged_walks
+        ):
+            logger.debug("rejected cycle candidate %s: construction_error=%s, validation=%s",
+                         candidate_index, construction_error, test_message)
+            continue
         walk_is_complete = test_merged_closed_walk(
             final_walk,
             sequence_edges, f_sequence_edge,
@@ -1849,7 +1894,11 @@ def select_best_closed_walk(
             int(walk_is_closed),
             -len(not_merged_walks),
         )
+        logger.debug("cycle candidate %s: rank=%r construction_error=%s segments=%r",
+                     candidate_index, rank, construction_error, segment_list)
+        debug_walk("cycle candidate merged walk", final_walk, circular=True)
         if best_rank is None or rank > best_rank:
+            logger.debug("cycle candidate %s became best", candidate_index)
             best_rank = rank
             best_candidate = {
                 "all_walks": all_closed_walks,
@@ -1864,6 +1913,7 @@ def select_best_closed_walk(
                 "matched_constraints": matched_constraints,
             }
 
+    logger.debug("chosen cycle: %r", best_candidate)
     return best_candidate
 
 
@@ -1876,13 +1926,17 @@ def select_best_s_t_walk(
     best_candidate = None
     best_rank = None
 
-    for _ in range(candidate_runs):
+    debug_solver_budget(F, f_sequence_edge, f_discordant_edge, f_concordant_edge)
+    for candidate_index in range(1, candidate_runs + 1):
+        logger.debug("path candidate %s/%s", candidate_index, candidate_runs)
         s_t_walks, construction_error = create_s_t_walks(
             sequence_edges, f_sequence_edge,
             discordant_edges, f_discordant_edge,
             concordant_edges, f_concordant_edge,
             1, segments, F,
         )
+        for index, walk in enumerate(s_t_walks):
+            debug_walk(f"path candidate {candidate_index} input {index}", walk)
         merged_walk, not_merged_walks = merge_all_closed_walks(s_t_walks)
         primary_walk = merged_walk
         if s_t_walks:
@@ -1919,7 +1973,11 @@ def select_best_s_t_walk(
             int(has_s_t_endpoints),
             -len(not_merged_walks),
         )
+        logger.debug("path candidate %s: rank=%r construction_error=%s segments=%r",
+                     candidate_index, rank, construction_error, segment_list)
+        debug_walk("path candidate merged walk", primary_walk)
         if best_rank is None or rank > best_rank:
+            logger.debug("path candidate %s became best", candidate_index)
             best_rank = rank
             best_candidate = {
                 "walks": s_t_walks,
@@ -1934,6 +1992,7 @@ def select_best_s_t_walk(
                 "matched_constraints": matched_constraints,
             }
 
+    logger.debug("chosen path: %r", best_candidate)
     return best_candidate
 
 
@@ -2935,6 +2994,11 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
         sum(remaining_discordant_edges.values()) +
         sum(remaining_concordant_edges.values())
     )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("after initial s-to-t walk: remaining_sequence=%r "
+                     "remaining_discordant=%r remaining_concordant=%r",
+                     dict(remaining_sequence_edges), dict(remaining_discordant_edges),
+                     dict(remaining_concordant_edges))
     if Number_Of_Remaining_edges > 0:
         Closed_Walks_Of_Path, error_in_closed_walks_of_path=create_closed_walks(remaining_sequence_edges, f_sequence_edge, remaining_discordant_edges, f_discordant_edge, 
                              remaining_concordant_edges, f_concordant_edge, max_attempts,segments, F)
@@ -3341,6 +3405,14 @@ parser.add_argument(
         "user-defined lower-bound constraint is added."
     ),
 )
+parser.add_argument(
+    "--debug",
+    action="store_true",
+    help=(
+        "Log the walk decomposition in detail (candidate walks, merges, ranks). "
+        "On large graphs this makes the log hundreds of MB."
+    ),
+)
 parser.add_argument("--version",action="version",version=f"CE version {__version__}",help="Print version and exit")
 parser.add_argument("--sort-by",choices=["CopyNumber", "LWCN"],default="CopyNumber",help="How to sort cycles/paths: CopyNumber (default) or LWCN")
 parser.add_argument("--s-t-strategy",choices=["all_nodes", "intervals"],default="all_nodes",help="s/t connection strategy: 'all_nodes' (default) or 'intervals' (only interval start/end)")
@@ -3460,7 +3532,7 @@ class Logger:
         while "\n" in self.buffer:
             line, self.buffer = self.buffer.split("\n", 1)
             if line.strip():
-                timestamp = datetime.now().strftime("[%H:%M:%S.%f ]  ")[:-3]
+                timestamp = datetime.now().strftime("[%H:%M:%S.%f")[:-3] + "]  "
                 self.log.write(f"{timestamp}{line}\n")
                 self.terminal.write(f"{line}\n")
             else:
@@ -3476,6 +3548,15 @@ class Logger:
         self.terminal.flush()
 # Open file in write mode (overwrite) or append mode ('a')
 sys.stdout = Logger(log_file)
+# Route DEBUG diagnostics through the same tee, so they are timestamped in the
+# log and stay in order with the rest of the output.
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+logger.addHandler(_log_handler)
+logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
+logger.propagate = False
+if args.debug:
+    print("Debug logging is enabled.")
 ####################### 
 
 #ilp_test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
@@ -3623,6 +3704,10 @@ while True: #while Iteration==1:
         concordant_edges, f_concordant_edge_val,
         segments, Path_Constraints, F_val,
         candidate_runs=max_random_search_heuristic_attempts)
+    if best_cycle_candidate is None:
+        print(f"Stopping cycle extraction at iteration {Iteration}: no valid decomposition found.")
+        Num_cycles = Cycle_Or_Path_Number - 1
+        break
     print(f"Selected the best of {max_random_search_heuristic_attempts} cycle-walk candidates; "
           f"matched {len(best_cycle_candidate['matched_constraints'])} path constraints.")
     all_closed_walks = best_cycle_candidate["all_walks"]
@@ -3691,6 +3776,9 @@ while True: #while Iteration==1:
         all_closed_walks = not_merged_walks
         Final_closed_walk, not_merged_walks = merge_all_closed_walks(all_closed_walks)
         Final_closed_walk_test, test_message = test_closed_walk(Final_closed_walk)
+        if not Final_closed_walk_test:
+            print(f"⚠️ Warning: Skipping a leftover cycle that failed validation: {test_message}")
+            continue
         Final_closed_walk_completion_test = test_merged_closed_walk(Final_closed_walk, sequence_edges, f_sequence_edge_val,
                    discordant_edges, f_discordant_edge_val,
                    concordant_edges, f_concordant_edge_val, base_F, Path=False)
@@ -3937,6 +4025,9 @@ while True: # while Iteration==1:
         all_closed_walks = not_merged_closed_walks_to_s_t_path
         Final_closed_walk, not_merged_closed_walks_to_s_t_path = merge_all_closed_walks(all_closed_walks)
         Final_closed_walk_test, test_message = test_closed_walk(Final_closed_walk)
+        if not Final_closed_walk_test:
+            print(f"⚠️ Warning: Skipping a leftover cycle that failed validation: {test_message}")
+            continue
         Final_closed_walk_completion_test = test_merged_closed_walk(Final_closed_walk, sequence_edges, f_sequence_edge_val,
                    discordant_edges, f_discordant_edge_val,
                    concordant_edges, f_concordant_edge_val, base_F, Path=False)
@@ -4007,9 +4098,13 @@ while True: # while Iteration==1:
 
 # Canonicalize equivalent structures before sorting and writing.
 for component in stable_iter(All_Cycles):
+    logger.debug("before canonicalization: %r", component)
     component["Segments"] = canonical_segments(component["Segments"], circular=True)
+    logger.debug("after canonicalization: %r", component)
 for component in stable_iter(All_Paths):
+    logger.debug("before canonicalization: %r", component)
     component["Segments"] = canonical_segments(component["Segments"], circular=False)
+    logger.debug("after canonicalization: %r", component)
 
 #Determine sorting key
 if args.sort_by == "CopyNumber":
@@ -4042,6 +4137,8 @@ for item in stable_iter(Disconnected_Solutions):
             
 #write_all_cycles_and_paths(segments, cycles_file_path, All_Cycles_Ordered, All_Paths_Ordered, Path_Constraints)
 
+logger.debug("final cycle ID mapping: %s", [(c["Cycle"], c["New_Order_Of_Cycle_Number"]) for c in All_Cycles_Ordered])
+logger.debug("final path ID mapping: %s", [(p["Path"], p["New_Order_Of_Path_Number"]) for p in All_Paths_Ordered])
 write_all_cycles_and_paths(segments, output_file, All_Cycles_Ordered, All_Paths_Ordered, Path_Constraints)
 
 if args.fasta_output:
