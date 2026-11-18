@@ -448,89 +448,128 @@ class EdgeMultiplicityModel:
             return (best_ri + partition[0] - 1, score)
         return None
 
-    @staticmethod
-    def enumerate_partitions(
-        k: int, start: int, end: int
-    ) -> Generator[List[List[int]], None, None]:
-        """Generate all partitions of the interval [start, end] into k parts."""
-        if k == 0:
-            yield [[start, end]]
-        else:
-            for i in stable_iter(range(1, end - start - k + 2)):
-                for res in stable_iter(EdgeMultiplicityModel.enumerate_partitions(k - 1, start + i, end)):
-                    yield [[start, start + i - 1], *res]
-
     def infer_discordant_edge_multiplicities(
         self, max_multiplicity: int = 5
     ) -> List[int]:
-        """Estimate the upper bound of multiplicities for each discordant edge."""
+        """Estimate the upper bound of multiplicities for each discordant edge.
+
+        The sorted read counts are cut into the fewest contiguous groups that all pass
+        check_valid_discordant_rc_partition. Among those splits, the one with the highest
+        score (group scores plus the log2 gaps between consecutive groups) wins, and exact
+        ties go to the lexicographically first split. Base members of a group get 1; the
+        others get their level over the base mean.
+
+        The split is found by dynamic programming over group boundaries. Enumerating all
+        C(n-1, k-1) splits, as before, could take days on graphs with hundreds of
+        discordant edges. The result is the same except at exact ties, where the
+        enumeration's choice depended on floating-point rounding.
+        """
         rc_list = [de.lr_count for de in stable_iter(self.discordant_edges)]  # Read counts
-        if len(rc_list) == 0:
+        return EdgeMultiplicityModel.multiplicities_from_read_counts(rc_list, max_multiplicity)
+
+    @staticmethod
+    def multiplicities_from_read_counts(
+        rc_raw: List[float], max_multiplicity: int = 5, tie_tol: float = 1e-9
+    ) -> List[int]:
+        """Multiplicity bound for each read count in rc_raw, in input order."""
+        if len(rc_raw) == 0:
             return []
-        rc_indices = np.argsort(rc_list)
-        rc_list = sorted(rc_list)
+        # An edge with no reads gives no evidence of repeated traversal. Give it 1 and
+        # leave it out: the scores take log2 of read counts.
+        positive = [e for e in range(len(rc_raw)) if rc_raw[e] > 0]
+        if len(positive) < len(rc_raw):
+            result = [1] * len(rc_raw)
+            inferred = EdgeMultiplicityModel.multiplicities_from_read_counts(
+                [rc_raw[e] for e in positive], max_multiplicity, tie_tol
+            )
+            for e, m in zip(positive, inferred):
+                result[e] = m
+            return result
+        rc_indices = np.argsort(rc_raw)
+        rc_list = sorted(rc_raw)
         if np.log2(rc_list[-1]) - np.log2(rc_list[0]) < 1.0:
-            return [1 for i in stable_iter(rc_indices)]
-        num_clusters = 1
-        valid_clustering = False
-        best_score_all = -10.0
-        best_partitions = []
-        distinct_all = []
-    
-        while not valid_clustering:
-            valid_clustering = False
-            for partitions in stable_iter(EdgeMultiplicityModel.enumerate_partitions(
-                num_clusters - 1, 0, len(rc_list) - 1
-            )):
-                valid_partition = True
-                score_all = 0.0
-                distinct = []
-                for pi in stable_iter(range(len(partitions))):
-                    partition = partitions[pi]
-                    scored_partition = EdgeMultiplicityModel.check_valid_discordant_rc_partition(
-                        rc_list,
-                        partition,
-                        max_multiplicity,
-                    )
-                    if scored_partition is None:
-                        valid_partition = False
-                        break
-                    base_ri, score = scored_partition
-                    score_all += score
-                    distinct.append([partitions[pi][0], base_ri])
-                    if pi > 0:
-                        score_all += np.log2(rc_list[partitions[pi][0]]) - np.log2(
-                            rc_list[partitions[pi - 1][1]]
-                        )
-                if valid_partition:
-                    valid_clustering = True
-                    if score_all > best_score_all:
-                        best_score_all = score_all
-                        best_partitions = partitions
-                        distinct_all = distinct
-            if not valid_clustering:
-                num_clusters += 1
+            return [1] * len(rc_list)
+        n = len(rc_list)
+        # A group whose last read count is at least (2 * max_multiplicity + 1) times its
+        # first is always rejected by the check (top level above max_multiplicity).
+        ratio_cap = 2 * max_multiplicity + 1
+
+        # w(a, b): score of group [a, b] plus the log2 gap to the previous group, and the
+        # last base index; None if the check rejects the group. Computed once, on demand.
+        cache: dict = {}
+
+        def w(a: int, b: int):
+            if (a, b) not in cache:
+                result = EdgeMultiplicityModel.check_valid_discordant_rc_partition(
+                    rc_list, [a, b], max_multiplicity
+                )
+                if result is None:
+                    cache[a, b] = None
+                else:
+                    gap = float(np.log2(rc_list[a]) - np.log2(rc_list[a - 1])) if a > 0 else 0.0
+                    cache[a, b] = (float(result[1]) + gap, result[0])
+            return cache[a, b]
+
+        NEG = -math.inf
+
+        def best(i: int, prev: List[float]) -> float:
+            # Best score for rc_list[i:] with first group [i, j] and prev[j + 1] after it.
+            value = NEG
+            for j in range(i, n):
+                if j > i and rc_list[j] >= ratio_cap * rc_list[i]:
+                    break
+                if prev[j + 1] > NEG:
+                    g = w(i, j)
+                    if g is not None:
+                        value = max(value, g[0] + prev[j + 1])
+            return value
+
+        # S[c][i]: best score for rc_list[i:] cut into exactly c valid groups. Layer c is
+        # completed only while S[c][0] is -inf, i.e. while c groups are too few. With
+        # positive read counts n singletons are always valid, so at most n layers.
+        S = [[NEG] * n + [0.0]]
+        while len(S) <= n:
+            prev = S[-1]
+            cur = [NEG] * (n + 1)
+            cur[0] = best(0, prev)
+            S.append(cur)
+            if cur[0] > NEG:
+                break
+            for i in range(1, n):
+                cur[i] = best(i, prev)
+        k = len(S) - 1
+        if S[k][0] == NEG or S[k][0] <= -10.0:
+            # The enumeration kept no split scoring at or below -10.
+            raise ValueError("No valid grouping of discordant edge read counts.")
+
+        # The first optimal split in enumeration order: at each step take the smallest
+        # group end that still reaches the optimum, within tie_tol.
+        groups, i = [], 0
+        for c in range(k, 0, -1):
+            j = i
+            for j in range(i, n):
+                g = w(i, j) if S[c - 1][j + 1] > NEG else None
+                if g is not None and g[0] + S[c - 1][j + 1] >= S[c][i] - tie_tol:
+                    break
+            groups.append((i, j))
+            i = j + 1
+
         multiplicities_sorted = []
-        for pi in stable_iter(range(len(best_partitions))):
-            partition = best_partitions[pi]
-            base_ = distinct_all[pi]
-            for i in stable_iter(range(base_[0], base_[1] + 1)):
-                multiplicities_sorted.append(1)
-            base_ri = base_[1] + 1
-            if base_ri > partition[1]:
+        for a, b in groups:
+            base_end = w(a, b)[1]
+            multiplicities_sorted += [1] * (base_end - a + 1)
+            if base_end + 1 > b:
                 continue
-            base_avg_rc = np.average(rc_list[base_[0] : base_[1] + 1])
+            base_avg_rc = np.average(rc_list[a : base_end + 1])
             multiplicity = 2
-            while rc_list[base_ri] / base_avg_rc >= multiplicity + 0.5:
+            while rc_list[base_end + 1] / base_avg_rc >= multiplicity + 0.5:
                 multiplicity += 1
-            for i in stable_iter(range(base_ri, partition[1] + 1)):
-                while rc_list[i] / base_avg_rc >= multiplicity + 0.5:
+            for t in range(base_end + 1, b + 1):
+                while rc_list[t] / base_avg_rc >= multiplicity + 0.5:
                     multiplicity += 1
                 multiplicities_sorted.append(multiplicity)
-        return [
-            multiplicities_sorted[list(rc_indices).index(i)]
-            for i in stable_iter(range(len(rc_list)))
-        ]
+        position = {int(e): p for p, e in enumerate(rc_indices)}
+        return [multiplicities_sorted[position[e]] for e in range(n)]
 #################
 def get_incident_edges(G, node, edge_type_filter=None):
     """
