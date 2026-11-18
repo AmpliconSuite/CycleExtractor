@@ -193,6 +193,7 @@ A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it i
 |`--seed`|	Random seed for Python, NumPy and the solver, 0..2000000000. Runs with the same seed give identical output.|	0
 |`--f-lower-bound`|	Optional lower bound (≥ 0) on the MILP copy number `F` of each cycle or path.|	none (no bound)
 |`--log_file`|	Path to the run log.|	`<output name>_ILP_log.txt` next to `--output` (`_ILP_Connectivity_log.txt` with `--enforce-connectivity`)
+|`--debug`|	Log the walk decomposition in detail: candidate walks, merges and their ranks. On graphs with dozens of sequence edges this makes the log hundreds of MB.|	off
 
 # Starting from bam files
 
