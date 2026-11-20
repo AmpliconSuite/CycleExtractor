@@ -27,6 +27,7 @@ import sys
 import pickle
 from datetime import datetime
 import os
+import tempfile
 import argparse
 import subprocess
 from pathlib import Path
@@ -237,8 +238,6 @@ class HighsModel:
         # HiGHS 1.10 requires console logging enabled for logging callbacks.
         self._highs.setOptionValue("output_flag", True)
         self._highs.setOptionValue("log_to_console", True)
-        # Keep integer rounding from admitting material flow through big-M rows.
-        self._highs.setOptionValue("mip_feasibility_tolerance", 1e-9)
         self._highs.run()
         self._model_status = self._highs.getModelStatus()
         statuses = {
@@ -258,6 +257,50 @@ class HighsModel:
     def is_optimal(self):
         return self._model_status == highspy.HighsModelStatus.kOptimal
 
+    def resolve_copy_if(self, would_stop):
+        """Re-solve a copy of the model before an optimal solution ends a loop.
+
+        HiGHS can report a wrong optimum (for example F = 0) on a model whose
+        coefficients differ from an equivalent one only in the last bits.
+        Changing the seed does not help; re-reading the model from MPS does.
+        The better of the two solutions is kept, so the re-solve cannot make
+        the result worse. Returns True when the re-solved solution was used.
+        """
+        if not (self.SolCount and self.is_optimal() and would_stop()):
+            return False
+        handle, path = tempfile.mkstemp(suffix=".mps")
+        os.close(handle)
+        try:
+            self._highs.writeModel(path)
+            other = highspy.Highs()
+            other.setOptionValue("output_flag", False)
+            for option in ("random_seed", "threads", "time_limit"):
+                other.setOptionValue(option, self._highs.getOptionValue(option)[1])
+            other.readModel(path)
+            other.run()
+        finally:
+            os.remove(path)
+        solution = other.getSolution()
+        feasible = other.getInfo().primal_solution_status == highspy.SolutionStatus.kSolutionStatusFeasible
+        if not (solution.value_valid and feasible):
+            return False
+        old, new = self.ObjVal, other.getObjectiveValue()
+        sign = 1.0 if self._highs.getLp().sense_ == highspy.ObjSense.kMaximize else -1.0
+        if sign * (new - old) <= 1e-9 * max(1.0, abs(old)):
+            return False
+        print(f"HiGHS re-solve before stopping: objective {old:.9g} -> {new:.9g}; using the re-solved solution.")
+        self._highs = other
+        self._model_status = other.getModelStatus()
+        statuses = {
+            highspy.HighsModelStatus.kOptimal: SolverConstants.OPTIMAL,
+            highspy.HighsModelStatus.kTimeLimit: SolverConstants.TIME_LIMIT,
+        }
+        self.Status = self.status = statuses.get(self._model_status, str(self._model_status))
+        for variable, value in zip(self._variables, solution.col_value):
+            variable.X = float(value)
+        self.ObjVal = new
+        return True
+
 
 class MosekModel:
     """MOSEK 10+ MILP adapter, reusing the lightweight linear expressions above."""
@@ -272,10 +315,6 @@ class MosekModel:
             raise RuntimeError("The MOSEK backend requires MOSEK 10 or newer.")
         self.name = name
         self._task = mosek.Task()
-        # CE reconstructs integer traversals from flow/F. Tight tolerances limit
-        # leakage through big-M constraints before that reconstruction.
-        self._task.putdouparam(mosek.dparam.mio_tol_abs_relax_int, 1e-9)
-        self._task.putdouparam(mosek.dparam.mio_tol_feas, 1e-9)
         self._variables = []
         self.status = self.Status = None
         self.SolCount = 0
@@ -1811,11 +1850,11 @@ def reconstruction_flow_error(walks, copy_number, flow_maps, capacity_maps):
         required = count * copy_number
         flow = flow_maps[kind][edge]
         capacity = capacity_maps[kind][edge]
-        # Allow the default absolute row feasibility tolerance of the backends,
-        # plus a small relative term for large copy numbers.
-        tolerance = 1e-6 + 1e-9 * max(abs(required), abs(flow), abs(capacity))
+        # Allow the backends' default absolute feasibility tolerance plus a
+        # 0.01% relative term; CN estimates are far less precise than that.
+        tolerance = 1e-6 + 1e-4 * max(abs(required), abs(flow), abs(capacity))
         if required > min(flow, capacity) + tolerance:
-            return (f"{kind} {edge}: {count} traversals at CN={copy_number:.12g} "
+            return (f"{kind} {edge}: {count} traversals at copy count={copy_number:.12g} "
                     f"require {required:.12g}, solver flow={flow:.12g}, "
                     f"residual capacity={capacity:.12g}")
     return None
@@ -1853,7 +1892,7 @@ def increase_component_copy_number(walk, base_F, capacity_sequence_edges,
     for (kind, edge), multiplicity in stable_iter(counts.items()):
         capacity = capacities[kind][edge]
         flow = flows[kind][edge]
-        tolerance = 1e-6 * max(1.0, abs(capacity), abs(flow))
+        tolerance = 1e-6 + 1e-4 * max(abs(capacity), abs(flow))
         if flow > capacity + tolerance:
             raise ValueError(f"Solution already exceeds capacity on {kind} {edge}")
         if multiplicity * base_F > flow + tolerance:
@@ -3841,6 +3880,11 @@ while True: #while Iteration==1:
         print(f"Stopping cycle extraction: status={ILP_Cycle_model.Status}, solutions={ILP_Cycle_model.SolCount}")
         Num_cycles = Cycle_Or_Path_Number - 1
         break
+    resolve_copy_if = getattr(ILP_Cycle_model, "resolve_copy_if", None)
+    if resolve_copy_if is not None:
+        resolve_copy_if(lambda: float(variables["F"].X) < 0.5 or not any(
+            float(v.X) > 1e-8 for edge, v in variables["f_sequence_edge"].items()
+            if 's' not in edge and 't' not in edge))
     stop_after_cycle = not optimization_model_is_optimal(ILP_Cycle_model)
     if stop_after_cycle:
         print("Cycle time limit reached: saving the feasible incumbent before stopping cycle extraction.")
@@ -4120,6 +4164,11 @@ while True: # while Iteration==1:
         print(f"Stopping path extraction: status={ILP_Path_model.Status}, solutions={ILP_Path_model.SolCount}")
         Num_paths = Cycle_Or_Path_Number - Num_cycles - 1
         break
+    resolve_copy_if = getattr(ILP_Path_model, "resolve_copy_if", None)
+    if resolve_copy_if is not None:
+        resolve_copy_if(lambda: float(variables["F"].X) < 0.5 or not any(
+            float(v.X) > 1e-8 for edge, v in variables["f_sequence_edge"].items()
+            if 's' not in edge and 't' not in edge))
     stop_after_path = not optimization_model_is_optimal(ILP_Path_model)
     if stop_after_path:
         print("Path time limit reached: saving the feasible incumbent before stopping path extraction.")

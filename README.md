@@ -33,12 +33,14 @@ Configure it using MOSEK's standard license location (for example,
 All three backends solve the same MILP, including optional connectivity constraints.
 MOSEK uses one solver thread and the supplied `--seed`; different solvers or versions
 can choose different solutions when multiple optima exist. MOSEK 8 and 9 are not supported.
-CE uses capacity-derived big-M bounds for every backend and tightens HiGHS's MIP
-feasibility tolerance and MOSEK's integer/feasibility tolerances to `1e-9`.
+CE uses capacity-derived big-M bounds for every backend and runs each solver at
+its default tolerances. When HiGHS reports an optimal solution that would end an
+extraction loop, CE solves a copy of the model read back from MPS and keeps the
+better of the two solutions, because HiGHS occasionally reports a wrong optimum.
 Before accepting a reconstruction, CE checks aggregate traversal flow across its
-components against both solver flow and residual edge capacity. If this check
-fails beyond numerical tolerance, that extraction stage stops and retains earlier
-accepted results.
+components against both solver flow and residual edge capacity, allowing
+1e-6 plus 0.01% of the edge's flow or capacity. If this check fails, that
+extraction stage stops and retains earlier accepted results.
 
 - Python packages:
   - numpy
