@@ -33,6 +33,7 @@ Configure it using MOSEK's standard license location (for example,
 All three backends solve the same MILP, including optional connectivity constraints.
 MOSEK uses one solver thread and the supplied `--seed`; different solvers or versions
 can choose different solutions when multiple optima exist. MOSEK 8 and 9 are not supported.
+MOSEK results with the same seed can differ between CPU architectures (for example AMD and Intel), so compare MOSEK runs only within one machine type.
 CE uses capacity-derived big-M bounds for every backend and runs each solver at
 its default tolerances. When HiGHS reports an optimal solution that would end an
 extraction loop, CE solves a copy of the model read back from MPS and keeps the
